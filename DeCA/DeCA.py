@@ -558,40 +558,40 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       subjectID = Path(closestToMeanLandmarkPath)
       while subjectID.suffix in {'.fcsv', '.mrk', '.json'}:
         subjectID = subjectID.with_suffix('')
-      self.logInfoDCL.insertPlainText(f"Closest sample to mean: {subjectID} \n")
+      self.logInfoDCL.appendPlainText(f"Closest sample to mean: {subjectID}")
       tempBaseModel = logic.getModelFileByID(self.folderNames['originalModels'], subjectID)
-      self.logInfoDCL.insertPlainText(f"Rigid Alignment to: {subjectID} \n")
+      self.logInfoDCL.appendPlainText(f"Rigid Alignment to: {subjectID}")
       removeScale = True
       logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
-      self.logInfoDCL.insertPlainText(f"Generating the average template \n")
+      self.logInfoDCL.appendPlainText(f"Generating the average template")
       self.atlasModel, self.atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'])
       slicer.mrmlScene.RemoveNode(tempBaseModel)
       slicer.mrmlScene.RemoveNode(tempBaseLMs)
       shutil.rmtree(self.folderNames['tempAlignedModels'])
       shutil.rmtree(self.folderNames['tempAlignedLMs'])
     atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
-    self.logInfoDCL.insertPlainText(f"Saving atlas model to {atlasModelPath} \n")
+    self.logInfoDCL.appendPlainText(f"Saving atlas model to {atlasModelPath}")
     slicer.util.saveNode(self.atlasModel, atlasModelPath)
     atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
-    self.logInfoDCL.insertPlainText(f"Saving atlas landmarks to {atlasLMPath} \n")
+    self.logInfoDCL.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
     slicer.util.saveNode(self.atlasLMs, atlasLMPath)
     self.getPointNumberButton.enabled = True
 
   def onGetPointNumberButton(self):
     logic = DeCALogic()
     subsampledTemplate, pointNumber = logic.runCheckPoints(self.atlasModel, self.spacingTolerance.value)
-    self.logInfoDCL.insertPlainText(f'The subsampled template has a total of {pointNumber} points. \n')
+    self.logInfoDCL.appendPlainText(f'The subsampled template has a total of {pointNumber} points.')
     self.DCLApplyButton.enabled = True
 
   def onDCLApplyButton(self):
     logic = DeCALogic()
     # rigidly align to template
-    self.logInfoDCL.insertPlainText(f"Rigid alignment to the atlas \n")
+    self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
     removeScale = True
     logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],
     self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale)
     # generate point correspondences
-    self.logInfoDCL.insertPlainText(f"Calculating point correspondences \n")
+    self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
     atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
     self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value)
     # setup for optional subsetting
@@ -667,7 +667,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         for j in range(templateIndex.GetNumberOfValues()):
           baseIndex = templateIndex.GetValue(j)
           alignedPoint = alignedMesh.GetPoint(baseIndex)
-          alignedPointNode.AddControlPoint(alignedPoint)
+          alignedPointNode.AddControlPoint(alignedPoint, str(j))
         outputLMPath = os.path.join(outputDirectory, self.modelNames[i]+".mrk.json")
         slicer.util.saveNode(alignedPointNode, outputLMPath)
         slicer.mrmlScene.RemoveNode(alignedPointNode)
@@ -676,7 +676,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       for j in range(templateIndex.GetNumberOfValues()):
         baseIndex = templateIndex.GetValue(j)
         basePoint = baseNode.GetPolyData().GetPoint(baseIndex)
-        basePointNode.AddControlPoint(basePoint)
+        basePointNode.AddControlPoint(basePoint, str(j))
       baseLMPath = os.path.join(outputDirectory, "atlas.mrk.json")
       slicer.util.saveNode(basePointNode, baseLMPath)
       #slicer.mrmlScene.RemoveNode(basePointNode)
@@ -755,7 +755,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
           mirrorLMNode =slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode",subjectID)
           for i in range(currentLMNode.GetNumberOfControlPoints()):
             point = currentLMNode.GetNthControlPointPosition(mirrorIndex[i])
-            mirrorLMNode.AddControlPoint(point)
+            mirrorLMNode.AddControlPoint(point, str(i))
             sourcePoints.InsertNextPoint(point)
           rigidTransform = vtk.vtkLandmarkTransform()
           rigidTransform.SetSourceLandmarks( sourcePoints )
@@ -775,7 +775,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
             mirrorSLMNode =slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode",subjectID)
             for i in range(currentSLMNode.GetNumberOfControlPoints()):
               point = currentSLMNode.GetNthControlPointPosition(mirrorSLMIndex[i])
-              mirrorSLMNode.AddControlPoint(point)
+              mirrorSLMNode.AddControlPoint(point, str(i))
             if currentSLMNode :
               currentSLMNode.SetAndObserveTransformNodeID(mirrorTransformNode.GetID())
               slicer.vtkSlicerTransformLogic().hardenTransform(currentSLMNode)
@@ -970,8 +970,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
 
   def numpyToFiducialNode(self, numpyArray, nodeName):
     fiducialNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode',nodeName)
-    for point in numpyArray:
-      fiducialNode.AddControlPoint(point)
+    for index in range(len(numpyArray)):
+      fiducialNode.AddControlPoint(numpyArray[index], str(index))
     return fiducialNode
 
   def computeAverageLM(self, fiducialGroup):
@@ -984,7 +984,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       groupArray_np[:,:,i] = pointData_np
     #Calculate mean point positions of aligned group
     averagePoints_np = np.mean(groupArray_np, axis=2)
-    averageLMNode = self.numpyToFiducialNode(averagePoints_np, "MeanTemplateLM")
+    averageLMNode = self.numpyToFiducialNode(averagePoints_np, "Atlas")
     return averageLMNode
 
   def fiducialNodeToPolyData(self, nodeLocation, loadOption=True):
