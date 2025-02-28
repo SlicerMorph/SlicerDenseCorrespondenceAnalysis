@@ -618,7 +618,8 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       # generate mirrored landmarks and models
       axis = [-1,1,1] #set symmetry to x-axis
       self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
-      logic.runMirroring(self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], axis, self.landmarkIndexText.text)
+      logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
+      self.folderNames['mirrorLMs'], axis, self.landmarkIndexText.text)
       self.logInfoDCL.appendPlainText(f"Calculating point correspondences to atlas")
       logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
       self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
@@ -747,7 +748,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     normals.Update()
     inputModel.SetAndObservePolyData(normals.GetOutput())
 
-  def runMirroring(self, meshDirectory, lmDirectory, mirrorMeshDirectory, mirrorLMDirectory, mirrorAxis, mirrorIndexText, slmDirectory, outputSLMDirectory, mirrorSLMIndexText):
+  def runMirroring(self, meshDirectory, lmDirectory, mirrorMeshDirectory, mirrorLMDirectory, mirrorAxis, mirrorIndexText, slmDirectory=None, outputSLMDirectory=None, mirrorSLMIndexText=None):
     mirrorMatrix = vtk.vtkMatrix4x4()
     mirrorMatrix.SetElement(0, 0, mirrorAxis[0])
     mirrorMatrix.SetElement(1, 1, mirrorAxis[1])
