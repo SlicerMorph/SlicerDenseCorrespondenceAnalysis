@@ -6,7 +6,7 @@ DeCA is an open-source tool for biologists and other researchers using 3D imagin
 <img src="DeCA.png" alt="DECA logo" width="500">
 
 ## Tutorials
-[Step-by-step tutorial to use DeCA for placing dense pseudo-landmarks on a set of models](https://github.com/SlicerMorph/Tutorials/tree/main/DeCAL#readme)
+[Step-by-step tutorial on use of DeCA for dense pseudo-landmarking a set of models](https://github.com/SlicerMorph/Tutorials/tree/main/DeCAL#readme)
 
 ## Citations
 1. Rolfe, S. M., and A. Murat Maga. “DeCA: A Dense Correspondence Analysis Toolkit for Shape Analysis.” International Workshop on Shape in Medical Imaging. Cham: Springer Nature Switzerland, 2023.
