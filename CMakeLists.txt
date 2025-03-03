@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(SlicerMorph)
+project(SlicerDeCA)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
