@@ -20,7 +20,6 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 # Extension modules
 add_subdirectory(DeCA)
-add_subdirectory(ReadLandmarksUBC)
 
 ## NEXT_MODULE
 
