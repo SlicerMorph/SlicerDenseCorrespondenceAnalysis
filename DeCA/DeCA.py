@@ -26,15 +26,14 @@ class DeCA(ScriptedLoadableModule):
   def __init__(self, parent):
     ScriptedLoadableModule.__init__(self, parent)
     self.parent.title = "DeCA" # TODO make this more human readable by adding spaces
-    self.parent.categories = ["DeCA Toolbox"]
+    self.parent.categories = ["SlicerMorph.DeCA Toolbox"]
     self.parent.dependencies = []
-    self.parent.contributors = ["Sara Rolfe (UW)"] # replace with "Firstname Lastname (Organization)"
+    self.parent.contributors = ["Sara Rolfe (SCRI)"] # replace with "Firstname Lastname (Organization)"
     self.parent.helpText = """
       This module provides several flexible workflows for finding and analyzing dense correspondence points between models.
       """
     self.parent.helpText += self.getDefaultModuleDocumentationLink()
-    self.parent.acknowledgementText = """
-
+    self.parent.acknowledgementText = """This extension was developed by funding from National Institutes of Health (OD032627 and HD104435) to A. Murat Maga (SCRI)
       """ # replace with organization, grant and thanks.
 
 #
