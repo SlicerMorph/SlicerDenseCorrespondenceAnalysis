@@ -1,5 +1,5 @@
-# DeCA
-Dense Correspondence Analysis (DeCA) for Surface is a toolkit built as an extension to the 3D Slicer Platform.
+# Dense Correspondence Analysis: DeCA
+Dense Correspondence Analysis (DeCA) for 3D surfaces is a toolkit built as an extension to the 3D Slicer Platform.
 
 DeCA is an open-source tool for biologists and other researchers using 3D imaging. DeCA integrates biological insights in the form of homologous landmark points with dense surface registration to provide highly detailed shape analysis of smooth and complex structures that are typically challenging to analyze with sparse manual landmarks alone.
 
