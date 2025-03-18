@@ -9,7 +9,7 @@ DeCA is an open-source tool for biologists and other researchers using 3D imagin
 [Step-by-step tutorial on use of DeCA for dense pseudo-landmarking a set of models](https://github.com/SlicerMorph/Tutorials/tree/main/DeCAL#readme)
 
 ## Citations
-1. [Rolfe, S. M., and A. Murat Maga. “DeCA: A Dense Correspondence Analysis Toolkit for Shape Analysis.” International Workshop on Shape in Medical Imaging. Cham: Springer Nature Switzerland, 2023.](https://www.researchgate.net/publication/375111739_DeCA_A_Dense_Correspondence_Analysis_Toolkit_for_Shape_Analysis)
+1. [Rolfe, S.M., Maga, A.M. (2023). DeCA: A Dense Correspondence Analysis Toolkit for Shape Analysis. In: Wachinger, C., Paniagua, B., Elhabian, S., Li, J., Egger, J. (eds) Shape in Medical Imaging. ShapeMI 2023. Lecture Notes in Computer Science, vol 14350. Springer, Cham. https://doi.org/10.1007/978-3-031-46914-5_21](https://www.researchgate.net/publication/375111739_DeCA_A_Dense_Correspondence_Analysis_Toolkit_for_Shape_Analysis)
 2. Rolfe, S. M., Mao, D., & Maga, A. M. (2025). Streamlining Asymmetry Quantification in Fetal Mouse Imaging: A Semi-Automated Pipeline Supported by Expert Guidance. Developmental Dynamics, (in press).
 
 ## Funding Acknowledgement
