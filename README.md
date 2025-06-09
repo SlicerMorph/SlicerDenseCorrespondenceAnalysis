@@ -3,7 +3,12 @@ Dense Correspondence Analysis (DeCA) for 3D surfaces is a toolkit built as an ex
 
 DeCA is an open-source tool for biologists and other researchers using 3D imaging. DeCA integrates biological insights in the form of homologous landmark points with dense surface registration to provide highly detailed shape analysis of smooth and complex structures that are typically challenging to analyze with sparse manual landmarks alone.
 
-<img src="./DeCA.png" alt="DECA logo" width="500">
+<img src="./DeCA.png" alt="DECA logo" width="300">
+
+## Modules
+DeCA comprises of three modules: The main **DeCA** module (with optional asymmetry analysis), **DeCAL** module for automated landmarking via template, and **Visualize Results** module to obtain heatmaps of shape and/or asymmetry differences from DeCA. 
+
+<img src="./DeCA_Modules.png" width="1200px">
 
 ## Tutorials
 * [Introduction to DeCA ](https://github.com/SlicerMorph/Tutorials/blob/main/DeCA_1/README.md)
