@@ -284,7 +284,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     #
     # Generate Atlas Button
     #
-    self.getAtlasButton = qt.QPushButton("Create\Load atlas")
+    self.getAtlasButton = qt.QPushButton("Create\\Load atlas")
     self.getAtlasButton.toolTip = "Generate a new atlas model and landmark set from data"
     self.getAtlasButton.enabled = False
     DeCALWidgetLayout.addRow(self.getAtlasButton)
