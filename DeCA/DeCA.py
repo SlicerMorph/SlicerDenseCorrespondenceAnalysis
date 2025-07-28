@@ -596,16 +596,16 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
         self.logInfoDC.appendPlainText(f"Can't load landmarks from: {atlasLMPath}")
         return
     else:
-      atlasModel, atlasLMs = self.generateNewAtlas(removeScaleOption, self.logInfoDC)
+      self.atlasModel, self.atlasLMs = self.generateNewAtlas(removeScaleOption, self.logInfoDC)
     # save atlas model and landmarks to output file
     atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
     self.logInfoDC.appendPlainText(f"Saving atlas model to {atlasModelPath}")
-    slicer.util.saveNode(atlasModel, atlasModelPath)
+    slicer.util.saveNode(self.atlasModel, atlasModelPath)
     atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
     self.logInfoDC.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
-    slicer.util.saveNode(atlasLMs, atlasLMPath)
+    slicer.util.saveNode(self.atlasLMs, atlasLMPath)
     # rigid alignment to atlas
-    logic.runAlign(atlasModel, atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],
+    logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],
     self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScaleOption)
     # run DeCA shape analysis
     if self.analysisTypeShape.checked:
@@ -623,8 +623,8 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
       self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
       self.writeErrorCheckBox.checked)
-    slicer.mrmlScene.RemoveNode(atlasModel)
-    slicer.mrmlScene.RemoveNode(atlasLMs)
+    slicer.mrmlScene.RemoveNode(self.atlasModel)
+    slicer.mrmlScene.RemoveNode(self.atlasLMs)
 
   def onDCLApplyButton(self):
     logic = DeCALogic()
