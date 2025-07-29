@@ -552,7 +552,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     log.appendPlainText(f"Closest sample to mean: {subjectID}")
     tempBaseModel = logic.getModelFileByID(self.folderNames['originalModels'], subjectID)
     log.appendPlainText(f"Rigid Alignment to: {subjectID}")
-    logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
+    try:
+      logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
+    except ValueError as errorText:
+      self.logInfoDCL.appendPlainText(str(errorText))
+      return
     self.logInfoDCL.appendPlainText(f"Generating the average template")
     atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'])
     slicer.mrmlScene.RemoveNode(tempBaseModel)
@@ -605,11 +609,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.logInfoDC.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
     slicer.util.saveNode(self.atlasLMs, atlasLMPath)
     # rigid alignment to atlas
-    logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],
-    self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScaleOption)
+    try:
+      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScaleOption)
+    except ValueError as errorText:
+      self.logInfoDC.appendPlainText(str(errorText))
+      return
     # run DeCA shape analysis
     if self.analysisTypeShape.checked:
-      self.logInfoDCL.appendPlainText(f"Calculating point correspondences to atlas")
+      self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
       logic.runDCAlign(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
       self.folderNames['alignedLMs'], self.folderNames['output'], self.writeErrorCheckBox.checked)
     # run DeCA symmetry analysis
@@ -631,8 +638,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     # rigidly align to template
     self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
     removeScale = True
-    logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],
-    self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale)
+    try:
+      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale)
+    except ValueError as errorText:
+      self.logInfoDCL.appendPlainText(str(errorText))
+      return
     # generate point correspondences
     self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
     atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
@@ -934,6 +944,9 @@ class DeCALogic(ScriptedLoadableModuleLogic):
           except:
             slicer.mrmlScene.RemoveNode(currentLMNode)
             continue
+          if currentLMNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
+            raise ValueError(f"Landmark points mismatch: subject has {currentLMNode.GetNumberOfControlPoints()} points, "
+              f"atlas has {baseLMNode.GetNumberOfControlPoints()} points")
           # set up transform between base lms and current lms
           sourcePoints = vtk.vtkPoints()
           for i in range(currentLMNode.GetNumberOfControlPoints()):
@@ -975,8 +988,6 @@ class DeCALogic(ScriptedLoadableModuleLogic):
             slicer.mrmlScene.RemoveNode(currentLMNode)
             slicer.mrmlScene.RemoveNode(currentMeshNode)
             slicer.mrmlScene.RemoveNode(transformNode)
-            #slicer.mrmlScene.RemoveNode(baseMeshNode)
-            #slicer.mrmlScene.RemoveNode(baseLMNode)
           except:
             print(f"could not find nodes to remove for {subjectID}")
 
