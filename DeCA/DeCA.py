@@ -596,9 +596,18 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     
     # Validate symmetry inputs BEFORE running any pipeline steps
     if symmetryOption:
+      # First, get the expected landmark count from the files
       try:
-        mirror_map_string = self.generateMirrorMapString()
-        self.logInfoDC.appendPlainText(f"Symmetry validation passed. Generated 0-based mirror map string (see console for full string).")
+        expected_landmark_count = self.getActualLandmarkCount(self.landmarkDirectoryDC.currentPath)
+      except Exception as e:
+        self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
+        print(f"DeCA Symmetry Error: {str(e)}")
+        return # Stop execution before any processing
+      
+      # Now validate and generate the mirror map with the expected count
+      try:
+        mirror_map_string = self.generateMirrorMapString(expected_landmark_count)
+        self.logInfoDC.appendPlainText(f"Symmetry validation passed. All {expected_landmark_count} landmarks specified.")
       except Exception as e:
         self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
         print(f"DeCA Symmetry Error: {str(e)}")
@@ -610,6 +619,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       return
     self.folderNames['originalLMs'] = self.landmarkDirectoryDC.currentPath
     self.folderNames['originalModels'] = self.meshDirectoryDC.currentPath
+    
     #generate or load atlas
     if loadAtlasOption:
       try:
@@ -694,6 +704,76 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     lmDirectorySubset = logic.runSubsetLandmarks(atlasNode, self.DCLLandmarkDirectory.currentPath, lmDirectorySubset)
 
   ##
+  ## NEW HELPER FUNCTION: getActualLandmarkCount
+  ##
+  def getActualLandmarkCount(self, landmarkDirectory):
+    """
+    Gets the actual number of landmarks from the first file in the directory.
+    Raises ValueError if no files found or can't read them.
+    """
+    import os
+    landmark_files = [f for f in os.listdir(landmarkDirectory) if f.endswith('.fcsv') or f.endswith('.json')]
+    
+    if not landmark_files:
+      raise ValueError(f"No landmark files (.fcsv or .json) found in directory: {landmarkDirectory}")
+    
+    # Load the first landmark file to check the count
+    sample_file = os.path.join(landmarkDirectory, landmark_files[0])
+    try:
+      sample_lm = slicer.util.loadMarkups(sample_file)
+      landmark_count = sample_lm.GetNumberOfControlPoints()
+      slicer.mrmlScene.RemoveNode(sample_lm)
+      return landmark_count
+    except Exception as e:
+      raise ValueError(f"Error reading landmark file {sample_file}: {str(e)}")
+  ##
+  ## END OF NEW HELPER FUNCTION
+  ##
+  
+  ##
+  ## NEW HELPER FUNCTION: validateSymmetryLandmarksAgainstFiles (DEPRECATED - validation moved to generateMirrorMapString)
+  ##
+  def validateSymmetryLandmarksAgainstFiles(self, landmarkDirectory, mirror_map_string):
+    """
+    Validates that the generated mirror map matches the actual number of landmarks in the files.
+    Raises ValueError if there's a mismatch.
+    """
+    # Get the expected number of landmarks from the mirror map
+    expected_landmark_count = len(mirror_map_string.split(','))
+    
+    # Check a sample landmark file to get the actual landmark count
+    import os
+    landmark_files = [f for f in os.listdir(landmarkDirectory) if f.endswith('.fcsv') or f.endswith('.json')]
+    
+    if not landmark_files:
+      raise ValueError(f"No landmark files (.fcsv or .json) found in directory: {landmarkDirectory}")
+    
+    # Load the first landmark file to check the count
+    sample_file = os.path.join(landmarkDirectory, landmark_files[0])
+    try:
+      sample_lm = slicer.util.loadMarkups(sample_file)
+      actual_landmark_count = sample_lm.GetNumberOfControlPoints()
+      slicer.mrmlScene.RemoveNode(sample_lm)
+      
+      if expected_landmark_count != actual_landmark_count:
+        raise ValueError(
+          f"Landmark count mismatch: You specified {expected_landmark_count} landmarks for symmetry analysis, "
+          f"but the landmark files contain {actual_landmark_count} landmarks. "
+          f"Please ensure all landmarks (1-{actual_landmark_count}) are assigned to Midline, Left, or Right fields."
+        )
+      
+      self.logInfoDC.appendPlainText(f"Validated: Symmetry map matches {actual_landmark_count} landmarks in files.")
+      
+    except Exception as e:
+      if "Landmark count mismatch" in str(e):
+        raise
+      else:
+        raise ValueError(f"Error validating landmark file {sample_file}: {str(e)}")
+  ##
+  ## END OF NEW HELPER FUNCTION
+  ##
+  
+  ##
   ## NEW HELPER FUNCTION: _parse_indices
   ##
   def _parse_indices(self, text):
@@ -718,11 +798,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
   ##
   ## NEW HELPER FUNCTION: generateMirrorMapString
   ##
-  def generateMirrorMapString(self):
+  def generateMirrorMapString(self, expected_landmark_count=None):
     """
     Generates the 0-based full mirror map string from the midline, left, and right UI fields.
     Prints the result to the console and returns the string.
     Raises a ValueError if validation fails.
+    
+    Args:
+      expected_landmark_count: If provided, validates that all landmarks are specified
     """
     try:
       midline_indices = self._parse_indices(self.midlineLandmarksText.text)
@@ -732,8 +815,8 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       if len(left_indices) != len(right_indices):
         raise ValueError(f"Error: Left ({len(left_indices)}) and Right ({len(right_indices)}) landmark lists have different lengths.")
       
-      total_landmarks = len(midline_indices) + len(left_indices) + len(right_indices)
-      if total_landmarks == 0:
+      num_specified_landmarks = len(midline_indices) + len(left_indices) + len(right_indices)
+      if num_specified_landmarks == 0:
         raise ValueError("Error: No indices provided in Midline, Left, or Right fields.")
             
       # Check for duplicates
@@ -742,21 +825,30 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       if len(all_indices_list) != len(all_indices_set):
         raise ValueError("Error: Duplicate indices found. Each landmark must be in only one list (midline, left, or right).")
 
-      # Check for 0-based completeness
-      expected_set = set(range(total_landmarks))
-      if all_indices_set != expected_set:
-        # Check for max index vs total landmarks
-        max_index = max(all_indices_list)
-        if max_index != total_landmarks - 1:
-            raise ValueError(f"Error: Landmark indices are not contiguous. Max 1-based index is {max_index + 1}, but total landmarks found is {total_landmarks}.")
-        
-        # Check for missing indices
-        missing = expected_set - all_indices_set
-        missing_1based = sorted([x + 1 for x in missing])
-        raise ValueError(f"Error: Missing indices. Total is {total_landmarks}, but these 1-based indices are not in any list: {missing_1based}")
+      # If expected count is provided, validate that ALL landmarks are specified
+      if expected_landmark_count is not None:
+        expected_indices = set(range(expected_landmark_count))
+        if all_indices_set != expected_indices:
+          missing_indices = expected_indices - all_indices_set
+          extra_indices = all_indices_set - expected_indices
+          
+          error_msg = f"Error: Not all landmarks are specified. The landmark files contain {expected_landmark_count} landmarks."
+          if missing_indices:
+            missing_1based = sorted([x + 1 for x in missing_indices])
+            error_msg += f"\nMissing landmarks (1-based): {missing_1based}"
+          if extra_indices:
+            extra_1based = sorted([x + 1 for x in extra_indices])
+            error_msg += f"\nExtra landmarks not in files (1-based): {extra_1based}"
+          error_msg += f"\nPlease ensure ALL landmarks (1-{expected_landmark_count}) are assigned to Midline, Left, or Right fields."
+          raise ValueError(error_msg)
+
+      # The mirror map size must accommodate the highest landmark index
+      max_index = max(all_indices_list)
+      total_landmarks = max_index + 1  # 0-based, so add 1
       
       # All checks passed, create the map
-      mirror_map = [0] * total_landmarks
+      # Initialize: each landmark maps to itself by default
+      mirror_map = list(range(total_landmarks))
       
       for i in midline_indices:
         mirror_map[i] = i
@@ -1221,6 +1313,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
   def getClosestToMeanIndex(self, meanShape, alignedPoints):
     import operator
     sampleNumber = alignedPoints.GetNumberOfBlocks()
+    if sampleNumber == 0:
+      raise ValueError("No landmark data available for Procrustes analysis")
     procrustesDistances = []
     for i in range(sampleNumber):
       alignedShape = alignedPoints.GetBlock(i)
@@ -1232,16 +1326,17 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         alignedShape.GetPoint(j,alignedPoint)
         distance += np.sqrt(vtk.vtkMath.Distance2BetweenPoints(meanPoint,alignedPoint))
       procrustesDistances.append(distance)
-    try:
-      min_index, min_value = min(enumerate(procrustesDistances), key=operator.itemgetter(1))
-      return min_index
-    except:
-      return 0
+    min_index, min_value = min(enumerate(procrustesDistances), key=operator.itemgetter(1))
+    return min_index
 
   def getClosestToMeanPath(self, landmarkDirectory):
     lmNames, landmarks = self.importLandmarks(landmarkDirectory)
+    if not lmNames:
+      raise ValueError(f"No landmark files found in directory: {landmarkDirectory}")
     meanShape, alignedLandmarks = self.procrustesImposition(landmarks, False)
     closestToMeanIndex = self.getClosestToMeanIndex(meanShape, alignedLandmarks)
+    if closestToMeanIndex >= len(lmNames):
+      raise ValueError(f"Index mismatch: computed index {closestToMeanIndex} but only {len(lmNames)} landmarks available")
     return lmNames[closestToMeanIndex]
 
   def denseCorrespondence(self, originalLandmarks, originalMeshes, writeErrorOption=False):
