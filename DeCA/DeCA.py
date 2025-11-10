@@ -593,6 +593,17 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     writeErrorOption = self.writeErrorCheckBox.checked
     loadAtlasOption = self.loadAtlasOptionDC.checked
     removeScaleOption = self.removeScaleCheckBoxDC.checked
+    
+    # Validate symmetry inputs BEFORE running any pipeline steps
+    if symmetryOption:
+      try:
+        mirror_map_string = self.generateMirrorMapString()
+        self.logInfoDC.appendPlainText(f"Symmetry validation passed. Generated 0-based mirror map string (see console for full string).")
+      except Exception as e:
+        self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
+        print(f"DeCA Symmetry Error: {str(e)}")
+        return # Stop execution before any processing
+    
     self.folderNames = self.setUpDeCADir(self.outputDirectoryDC.currentPath, symmetryOption, writeErrorOption, False, loadAtlasOption)
     if self.folderNames == {}:
       self.logInfoDC.appendPlainText(f'Output folders could not be created in {self.outputDirectoryDC.currentPath}')
@@ -637,24 +648,15 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     # run DeCA symmetry analysis
     else:
       ##
-      ## MODIFIED SECTION: Generate mirror map string from new UI fields
+      ## MODIFIED SECTION: Use the mirror map string already validated and generated at start
       ##
       # generate mirrored landmarks and models
       axis = [-1,1,1] #set symmetry to x-axis
       
-      ## NEW: Generate mirror map string from UI fields
-      try:
-          mirror_map_string = self.generateMirrorMapString()
-          self.logInfoDC.appendPlainText(f"Generated 0-based mirror map string (see console for full string).")
-      except Exception as e:
-          self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
-          print(f"DeCA Symmetry Error: {str(e)}")
-          return # Stop execution
-      ## END NEW
-      
+      # mirror_map_string was already generated and validated at the start of onDCApplyButton
       self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
       logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
-      self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the new generated string
+      self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the validated string
       self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
       logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
       self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
