@@ -655,7 +655,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
       logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
       self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the new generated string
-      self.logInfoDCL.appendPlainText(f"Calculating point correspondences to atlas")
+      self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
       logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
       self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
       self.writeErrorCheckBox.checked)
@@ -707,7 +707,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       if any(i < 0 for i in indices):
         raise ValueError("Invalid index. Indices must be 1-based (e.g., '1, 2, 3'). Found '0' or a negative number.")
       return indices
-    except Exception as e:
+    except (ValueError, TypeError) as e:
       raise ValueError(f"Error parsing indices: '{e}'. Please use comma-separated numbers (e.g., '1, 2, 3').")
   ##
   ## END OF NEW HELPER FUNCTION
@@ -732,7 +732,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       
       total_landmarks = len(midline_indices) + len(left_indices) + len(right_indices)
       if total_landmarks == 0:
-            raise ValueError("Error: No indices provided in Midline, Left, or Right fields.")
+        raise ValueError("Error: No indices provided in Midline, Left, or Right fields.")
             
       # Check for duplicates
       all_indices_list = midline_indices + left_indices + right_indices
@@ -929,7 +929,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
           ##
           try:
             for i in range(currentLMNode.GetNumberOfControlPoints()):
-              point = currentLMNode.GetNthControlPointPosition(mirrorIndex[i])
+              mirror_idx = mirrorIndex[i]
+              point = currentLMNode.GetNthControlPointPosition(mirror_idx)
               mirrorLMNode.AddControlPoint(point, str(i))
               sourcePoints.InsertNextPoint(point)
           except IndexError:
@@ -939,7 +940,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
             slicer.mrmlScene.RemoveNode(currentMeshNode)
             slicer.mrmlScene.RemoveNode(mirrorTransformNode)
             slicer.mrmlScene.RemoveNode(mirrorLMNode)
-            raise ValueError(f"Symmetry map error for subject {subjectID}: The generated map has an index ({mirrorIndex[i]}) that is out of bounds for the landmark file (total points: {currentLMNode.GetNumberOfControlPoints()}).")
+            raise ValueError(f"Symmetry map error for subject {subjectID}: The generated map has an index ({mirror_idx if 'mirror_idx' in locals() else 'unknown'}) that is out of bounds for the landmark file (total points: {currentLMNode.GetNumberOfControlPoints()}).")
           
           rigidTransform = vtk.vtkLandmarkTransform()
           rigidTransform.SetSourceLandmarks(sourcePoints)
