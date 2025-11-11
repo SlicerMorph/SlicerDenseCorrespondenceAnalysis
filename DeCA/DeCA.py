@@ -913,6 +913,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     modelExt=['ply','stl','vtp', 'vtk']
     self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
     landmarkNames, landmarks = self.importLandmarks(landmarkDirectory)
+    # Validate that landmark and mesh files match
+    self.validateMatchingFiles(landmarkNames, self.modelNames, landmarkDirectory, meshDirectory)
     self.outputDirectory = outputDirectory
     denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseNode.GetPolyData(), baseLandmarks)
     # get downsampled template with index array
@@ -1090,6 +1092,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     modelExt=['ply','stl','vtp']
     self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
     landmarkNames,landmarks = self.importLandmarks(landmarkDirectory)
+    # Validate that landmark and mesh files match
+    self.validateMatchingFiles(landmarkNames, self.modelNames, landmarkDirectory, meshDirectory)
     denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks)
     self.addMagnitudeFeature(denseCorrespondenceGroup, self.modelNames, baseMesh)
     # save results to output directory
@@ -1108,8 +1112,12 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     modelExt=['ply','stl','vtp']
     self.modelNames, models = self.importMeshes(meshDir, modelExt)
     landmarkNames, landmarks = self.importLandmarks(landmarkDir)
+    # Validate that landmark and mesh files match for original files
+    self.validateMatchingFiles(landmarkNames, self.modelNames, landmarkDir, meshDir)
     modelMirrorNames, mirrorModels = self.importMeshes(mirrorMeshDir, modelExt)
     mirrorLandmarkNames, mirrorLandmarks = self.importLandmarks(mirrorLandmarkDir)
+    # Validate that landmark and mesh files match for mirror files
+    self.validateMatchingFiles(mirrorLandmarkNames, modelMirrorNames, mirrorLandmarkDir, mirrorMeshDir)
     denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks)
     denseCorrespondenceGroupMirror = self.denseCorrespondenceBaseMesh(mirrorLandmarks, mirrorModels, baseMesh, baseLandmarks)
     self.addMagnitudeFeatureSymmetry(denseCorrespondenceGroup, denseCorrespondenceGroupMirror, self.modelNames, baseMesh)
@@ -1122,6 +1130,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     modelExt=['ply','stl','vtp','vtk']
     self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
     landmarkNames, landmarks = self.importLandmarks(landmarkDirectory)
+    # Validate that landmark and mesh files match
+    self.validateMatchingFiles(landmarkNames, self.modelNames, landmarkDirectory, meshDirectory)
     [denseCorrespondenceGroup, closestToMeanIndex] = self.denseCorrespondence(landmarks, models)
     print("Sample closest to mean: ", closestToMeanIndex)
     # compute mean model
@@ -1272,6 +1282,54 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     slicer.mrmlScene.RemoveNode(fiducialNode)
     return polydataPoints
 
+  def getLandmarkBaseName(self, filename):
+    """Extract base name from landmark file, handling compound extensions like .mrk.json"""
+    fileNameBase = Path(filename)
+    while fileNameBase.suffix in {'.fcsv', '.mrk', '.json'}:
+      fileNameBase = fileNameBase.with_suffix('')
+    return str(fileNameBase)
+
+  def validateMatchingFiles(self, landmarkNames, meshNames, landmarkDir, meshDir):
+    """Validate that landmark and mesh files have matching base names"""
+    # Extract base names from landmark files
+    landmarkBases = [self.getLandmarkBaseName(lm) for lm in landmarkNames]
+    
+    # Find mismatches
+    landmarkSet = set(landmarkBases)
+    meshSet = set(meshNames)
+    
+    onlyInLandmarks = landmarkSet - meshSet
+    onlyInMeshes = meshSet - landmarkSet
+    
+    if onlyInLandmarks or onlyInMeshes:
+      errorMsg = "File prefix mismatch detected between landmark and mesh directories.\n\n"
+      if onlyInLandmarks:
+        errorMsg += f"Landmark files without matching mesh files:\n"
+        for name in sorted(onlyInLandmarks):
+          errorMsg += f"  - {name}\n"
+        errorMsg += f"\nLandmark directory: {landmarkDir}\n\n"
+      if onlyInMeshes:
+        errorMsg += f"Mesh files without matching landmark files:\n"
+        for name in sorted(onlyInMeshes):
+          errorMsg += f"  - {name}\n"
+        errorMsg += f"\nMesh directory: {meshDir}\n\n"
+      errorMsg += "Please ensure that each landmark file has a corresponding mesh file with the same base name."
+      raise ValueError(errorMsg)
+    
+    # Verify they are in the same order after sorting
+    if landmarkBases != meshNames:
+      errorMsg = "File ordering mismatch detected.\n\n"
+      errorMsg += "Landmark files (by base name):\n"
+      for name in landmarkBases:
+        errorMsg += f"  - {name}\n"
+      errorMsg += f"\nMesh files:\n"
+      for name in meshNames:
+        errorMsg += f"  - {name}\n"
+      errorMsg += f"\nLandmark directory: {landmarkDir}\n"
+      errorMsg += f"Mesh directory: {meshDir}\n\n"
+      errorMsg += "Files are present but in different order. This should not happen with sorted file lists."
+      raise ValueError(errorMsg)
+
   def importLandmarks(self, topDir):
     fiducialGroup = vtk.vtkMultiBlockDataGroupFilter()
     fileNameList = []
@@ -1346,10 +1404,32 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     # get base mesh as the closest to the mean shape
     baseIndex = self.getClosestToMeanIndex(meanShape, alignedPoints)
     baseMesh = originalMeshes.GetBlock(baseIndex)
-    baseLandmarks = originalLandmarks.GetBlock(baseIndex).GetPoints()
+    baseLandmarksBlock = originalLandmarks.GetBlock(baseIndex)
+    
+    # Check that the block exists
+    if baseLandmarksBlock is None:
+      raise ValueError(
+        f"Internal error: Unable to retrieve landmark data at index {baseIndex}. "
+        f"This may indicate a mismatch between landmark and mesh files. "
+        f"Please ensure that each landmark file has a corresponding mesh file with the same base name."
+      )
+    
+    baseLandmarks = baseLandmarksBlock.GetPoints()
     for i in range(sampleNumber):
-      correspondingMesh = self.denseSurfaceCorrespondencePair(originalMeshes.GetBlock(i),
-      originalLandmarks.GetBlock(i).GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
+      # Check that blocks exist for this sample
+      meshBlock = originalMeshes.GetBlock(i)
+      landmarkBlock = originalLandmarks.GetBlock(i)
+      
+      if meshBlock is None or landmarkBlock is None:
+        raise ValueError(
+          f"Internal error: Unable to retrieve data at index {i}. "
+          f"Mesh block exists: {meshBlock is not None}, Landmark block exists: {landmarkBlock is not None}. "
+          f"This may indicate a mismatch between landmark and mesh files. "
+          f"Please ensure that each landmark file has a corresponding mesh file with the same base name."
+        )
+      
+      correspondingMesh = self.denseSurfaceCorrespondencePair(meshBlock,
+      landmarkBlock.GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
       baseMesh, baseLandmarks, meanShape, i)
       denseCorrespondenceGroup.AddInputData(correspondingMesh)
 
