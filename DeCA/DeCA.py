@@ -569,7 +569,7 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     try:
       logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
     except ValueError as errorText:
-      self.logInfoDCL.appendPlainText(str(errorText))
+      log.appendPlainText(str(errorText))
       return
     log.appendPlainText(f"Generating the average template")
     atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'], log)
