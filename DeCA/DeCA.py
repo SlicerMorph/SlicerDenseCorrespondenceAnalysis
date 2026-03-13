@@ -564,16 +564,15 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     subjectID = Path(closestToMeanLandmarkPath)
     while subjectID.suffix in {'.fcsv', '.mrk', '.json'}:
       subjectID = subjectID.with_suffix('')
-    log.appendPlainText(f"Closest sample to mean: {subjectID}")
+    log.appendPlainText(f"Sample selected for rigid alignment: {subjectID}")
     tempBaseModel = logic.getModelFileByID(self.folderNames['originalModels'], subjectID)
-    log.appendPlainText(f"Rigid Alignment to: {subjectID}")
     try:
       logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
     except ValueError as errorText:
       self.logInfoDCL.appendPlainText(str(errorText))
       return
-    self.logInfoDCL.appendPlainText(f"Generating the average template")
-    atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'])
+    log.appendPlainText(f"Generating the average template")
+    atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'], log)
     slicer.mrmlScene.RemoveNode(tempBaseModel)
     slicer.mrmlScene.RemoveNode(tempBaseLMs)
     shutil.rmtree(self.folderNames['tempAlignedModels'])
@@ -1118,12 +1117,13 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     outputModelPath = os.path.join(outputDir, outputModelName)
     slicer.util.saveNode(baseNode, outputModelPath)
 
-  def runMean(self, landmarkDirectory, meshDirectory):
+  def runMean(self, landmarkDirectory, meshDirectory, log=None):
     modelExt=['ply','stl','vtp','vtk']
     self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
     landmarkNames, landmarks = self.importLandmarks(landmarkDirectory)
     [denseCorrespondenceGroup, closestToMeanIndex] = self.denseCorrespondence(landmarks, models)
-    print("Sample closest to mean: ", closestToMeanIndex)
+    if log:
+      log.appendPlainText(f"Sample selected for base model calculation: {self.modelNames[closestToMeanIndex]}")
     # compute mean model
     averagePolyData = self.computeAverageModelFromGroup(denseCorrespondenceGroup, closestToMeanIndex)
     averageModelNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode', 'Atlas Model')
