@@ -986,14 +986,20 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       return None
 
     def mergeAndSave(fixedPath, semiPath, outputName):
-      fixedNode = slicer.util.loadMarkups(fixedPath)
-      semiNode = slicer.util.loadMarkups(semiPath)
-      mergedNode = mergeLogic.mergeLMNodes(fixedNode, semiNode)
-      mergedNode.SetName(outputName)
-      slicer.util.saveNode(mergedNode, os.path.join(outputDirectory, outputName + ".mrk.json"))
-      slicer.mrmlScene.RemoveNode(fixedNode)
-      slicer.mrmlScene.RemoveNode(semiNode)
-      slicer.mrmlScene.RemoveNode(mergedNode)
+      fixedNode = semiNode = mergedNode = None
+      try:
+        fixedNode = slicer.util.loadMarkups(fixedPath)
+        semiNode = slicer.util.loadMarkups(semiPath)
+        # mergeLMNodes concatenates fixed then semi points and tags them with the
+        # "Fixed"/"Semi" control point descriptions
+        mergedNode = mergeLogic.mergeLMNodes(fixedNode, semiNode)
+        mergedNode.SetName(outputName)
+        slicer.util.saveNode(mergedNode, os.path.join(outputDirectory, outputName + ".mrk.json"))
+      finally:
+        # always remove any nodes we loaded/created, even if the merge failed
+        for node in (fixedNode, semiNode, mergedNode):
+          if node is not None:
+            slicer.mrmlScene.RemoveNode(node)
 
     mergedCount = 0
     # mergeLMNodes inserts control points one at a time; while the node is in the
@@ -1016,13 +1022,21 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         subjectID = Path(semiFileName)
         while subjectID.suffix in {'.fcsv', '.mrk', '.json'}:
           subjectID = subjectID.with_suffix('')
-        mergeAndSave(fixedFilePath, os.path.join(semiLMDirectory, semiFileName), str(subjectID) + "_merged")
-        mergedCount += 1
+        # merging is an optional post-processing step; a failure on one subject
+        # (e.g. a malformed file) must not abort the whole apply flow, so log and skip
+        try:
+          mergeAndSave(fixedFilePath, os.path.join(semiLMDirectory, semiFileName), str(subjectID) + "_merged")
+          mergedCount += 1
+        except Exception as e:
+          logging.warning(f"DeCAL merge: skipping {semiFileName} ({e})")
       # merge the atlas: its fixed landmarks with its dense correspondence points
       atlasSemiPath = os.path.join(semiLMDirectory, "atlas.mrk.json")
       if atlasFixedLMPath and os.path.exists(atlasFixedLMPath) and os.path.exists(atlasSemiPath):
-        mergeAndSave(atlasFixedLMPath, atlasSemiPath, "atlas_merged")
-        mergedCount += 1
+        try:
+          mergeAndSave(atlasFixedLMPath, atlasSemiPath, "atlas_merged")
+          mergedCount += 1
+        except Exception as e:
+          logging.warning(f"DeCAL merge: skipping atlas ({e})")
     finally:
       slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
       slicer.app.resumeRender()
