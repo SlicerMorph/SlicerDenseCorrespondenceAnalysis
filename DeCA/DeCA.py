@@ -286,6 +286,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCALWidgetLayout.addRow("DeCAL output directory: ", self.OutputDirectoryDCL)
 
     #
+    # Generate Atlas Button
+    #
+    self.getAtlasButton = qt.QPushButton("Create\\Load atlas")
+    self.getAtlasButton.toolTip = "Generate a new atlas model and landmark set from data"
+    self.getAtlasButton.enabled = False
+    DeCALWidgetLayout.addRow(self.getAtlasButton)
+
+    #
     # Set spacing tolerance
     #
     self.spacingTolerance = ctk.ctkSliderWidget()
@@ -297,20 +305,20 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCALWidgetLayout.addRow("Point density adjustment: ", self.spacingTolerance)
 
     #
-    # Generate Atlas Button
-    #
-    self.getAtlasButton = qt.QPushButton("Create\\Load atlas")
-    self.getAtlasButton.toolTip = "Generate a new atlas model and landmark set from data"
-    self.getAtlasButton.enabled = False
-    DeCALWidgetLayout.addRow(self.getAtlasButton)
-
-    #
     # Get Subsample Rate Button
     #
     self.getPointNumberButton = qt.QPushButton("Run subsampling")
     self.getPointNumberButton.toolTip = "Get the number of output points that will be generated"
     self.getPointNumberButton.enabled = False
     DeCALWidgetLayout.addRow(self.getPointNumberButton)
+
+    #
+    # Merge generated semi-landmarks with fixed landmarks option
+    #
+    self.mergeLandmarksCheckBoxDCL = qt.QCheckBox()
+    self.mergeLandmarksCheckBoxDCL.checked = True
+    self.mergeLandmarksCheckBoxDCL.setToolTip("If checked, the generated semi-landmarks are merged with the fixed landmarks used to establish correspondence (using the SlicerMorph MergeMarkups module) and saved to a 'mergedLMs' folder.")
+    DeCALWidgetLayout.addRow("Generate merged point lists: ", self.mergeLandmarksCheckBoxDCL)
 
     #
     # Apply Button
@@ -690,6 +698,22 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
     atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
     self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value)
+    # optionally merge the generated semi-landmarks with the fixed landmarks used
+    # to establish correspondence (both are in the atlas-aligned coordinate frame)
+    if self.mergeLandmarksCheckBoxDCL.checked:
+      mergedDirectory = os.path.join(self.folderNames['output'], "mergedLMs")
+      try:
+        os.makedirs(mergedDirectory, exist_ok=True)
+      except OSError:
+        self.logInfoDCL.appendPlainText(f"Could not create merged landmark folder: {mergedDirectory}")
+      else:
+        self.logInfoDCL.appendPlainText(f"Merging fixed and semi-landmarks into {mergedDirectory}")
+        atlasFixedLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
+        mergedCount = logic.runMergeLandmarks(self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], mergedDirectory, atlasFixedLMPath)
+        if mergedCount is None:
+          self.logInfoDCL.appendPlainText("Merge skipped: the SlicerMorph extension (MergeMarkups module) is required. Please install SlicerMorph.")
+        else:
+          self.logInfoDCL.appendPlainText(f"Saved {mergedCount} merged landmark files.")
     # setup for optional subsetting
     self.pointSelection.setCurrentNode(atlasDenseLandmarks)
     self.DCLLandmarkDirectory.setCurrentPath(self.folderNames['DeCALOutput'])
@@ -946,6 +970,63 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     else:
       print("No index found")
       return None
+
+  def runMergeLandmarks(self, fixedLMDirectory, semiLMDirectory, outputDirectory, atlasFixedLMPath=None):
+    # Merge each subject's fixed landmarks (used to establish correspondence) with
+    # the DeCAL-generated semi-landmarks, and also merge the atlas itself (its fixed
+    # landmarks at atlasFixedLMPath with the atlas dense points saved as
+    # atlas.mrk.json). The per-subject fixed and semi files share a basename, so they
+    # are matched by filename. Fixed points get the description "Fixed" and semi
+    # points get "Semi". Returns the number of merged files written, or None if the
+    # SlicerMorph MergeMarkups module is not available (extension not installed).
+    try:
+      import MergeMarkups
+      mergeLogic = MergeMarkups.MergeMarkupsLogic()
+    except (ImportError, AttributeError):
+      return None
+
+    def mergeAndSave(fixedPath, semiPath, outputName):
+      fixedNode = slicer.util.loadMarkups(fixedPath)
+      semiNode = slicer.util.loadMarkups(semiPath)
+      mergedNode = mergeLogic.mergeLMNodes(fixedNode, semiNode)
+      mergedNode.SetName(outputName)
+      slicer.util.saveNode(mergedNode, os.path.join(outputDirectory, outputName + ".mrk.json"))
+      slicer.mrmlScene.RemoveNode(fixedNode)
+      slicer.mrmlScene.RemoveNode(semiNode)
+      slicer.mrmlScene.RemoveNode(mergedNode)
+
+    mergedCount = 0
+    # mergeLMNodes inserts control points one at a time; while the node is in the
+    # scene each insertion fires a scene/subject-hierarchy update, so a large point
+    # set takes several seconds to merge. Batching the scene state and pausing
+    # rendering around the whole loop suppresses those per-point updates (~150x
+    # faster on dense DeCAL output). EndState/resumeRender must always run, hence
+    # the try/finally.
+    slicer.app.pauseRender()
+    slicer.mrmlScene.StartState(slicer.vtkMRMLScene.BatchProcessState)
+    try:
+      for semiFileName in sorted(os.listdir(semiLMDirectory)):
+        if semiFileName.startswith(".") or not semiFileName.endswith((".fcsv", ".json")):
+          continue
+        # the atlas point set (atlas.mrk.json) has no matching per-subject fixed
+        # file here; it is merged separately below using atlasFixedLMPath
+        fixedFilePath = os.path.join(fixedLMDirectory, semiFileName)
+        if not os.path.exists(fixedFilePath):
+          continue
+        subjectID = Path(semiFileName)
+        while subjectID.suffix in {'.fcsv', '.mrk', '.json'}:
+          subjectID = subjectID.with_suffix('')
+        mergeAndSave(fixedFilePath, os.path.join(semiLMDirectory, semiFileName), str(subjectID) + "_merged")
+        mergedCount += 1
+      # merge the atlas: its fixed landmarks with its dense correspondence points
+      atlasSemiPath = os.path.join(semiLMDirectory, "atlas.mrk.json")
+      if atlasFixedLMPath and os.path.exists(atlasFixedLMPath) and os.path.exists(atlasSemiPath):
+        mergeAndSave(atlasFixedLMPath, atlasSemiPath, "atlas_merged")
+        mergedCount += 1
+    finally:
+      slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
+      slicer.app.resumeRender()
+    return mergedCount
 
   def downsampleModel(self, model, spacingPercentage):
     points=model.GetPolyData()
