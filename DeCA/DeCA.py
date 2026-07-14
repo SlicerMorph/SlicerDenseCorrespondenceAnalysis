@@ -702,8 +702,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     # rigidly align to template
     self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
     removeScale = True
+    # only persist per-subject alignment transforms when original-frame output is
+    # requested, so an unchecked run does no extra transform I/O
+    transformDirectory = self.folderNames['alignmentTransforms'] if self.originalFrameCheckBoxDCL.checked else None
     try:
-      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale, transformDirectory=self.folderNames['alignmentTransforms'])
+      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale, transformDirectory=transformDirectory)
     except ValueError as errorText:
       self.logInfoDCL.appendPlainText(str(errorText))
       return
@@ -731,7 +734,6 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     # optionally also express the output in each subject's original (un-aligned)
     # coordinate frame by inverting the saved per-subject alignment transform
     if self.originalFrameCheckBoxDCL.checked:
-      transformDirectory = self.folderNames['alignmentTransforms']
       originalSemiDirectory = os.path.join(self.folderNames['output'], "DeCALOutput_originalFrame")
       self.logInfoDCL.appendPlainText(f"Mapping semi-landmarks back to the original model coordinate frame")
       semiCount = logic.runBackTransformLandmarks(self.folderNames['DeCALOutput'], transformDirectory, originalSemiDirectory)
@@ -1081,41 +1083,50 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       return 0
     os.makedirs(outputDirectory, exist_ok=True)
     writtenCount = 0
-    for lmFileName in sorted(os.listdir(landmarkDirectory)):
-      if lmFileName.startswith(".") or not lmFileName.endswith((".fcsv", ".json")):
-        continue
-      base = Path(lmFileName)
-      while base.suffix in {'.fcsv', '.mrk', '.json'}:
-        base = base.with_suffix('')
-      transformKey = str(base)
-      if transformSuffix and transformKey.endswith(transformSuffix):
-        transformKey = transformKey[:-len(transformSuffix)]
-      transformPath = os.path.join(transformDirectory, transformKey + ".h5")
-      if not os.path.exists(transformPath):
-        # expected for the atlas point set (no per-subject alignment); log for others
-        logging.info(f"DeCAL back-transform: no alignment transform for {lmFileName}, skipping")
-        continue
-      lmNode = xfNode = inverseNode = None
-      try:
-        lmNode = slicer.util.loadMarkups(os.path.join(landmarkDirectory, lmFileName))
-        xfNode = slicer.util.loadTransform(transformPath)
-        forwardMatrix = vtk.vtkMatrix4x4()
-        if not xfNode.GetMatrixTransformToParent(forwardMatrix):
-          raise ValueError("alignment transform is not linear")
-        inverseMatrix = vtk.vtkMatrix4x4()
-        vtk.vtkMatrix4x4.Invert(forwardMatrix, inverseMatrix)
-        inverseNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "DeCALInverseTransform")
-        inverseNode.SetMatrixTransformToParent(inverseMatrix)
-        lmNode.SetAndObserveTransformNodeID(inverseNode.GetID())
-        slicer.vtkSlicerTransformLogic().hardenTransform(lmNode)
-        slicer.util.saveNode(lmNode, os.path.join(outputDirectory, lmFileName))
-        writtenCount += 1
-      except Exception as e:
-        logging.warning(f"DeCAL back-transform: skipping {lmFileName} ({e})")
-      finally:
-        for node in (lmNode, xfNode, inverseNode):
-          if node is not None:
-            slicer.mrmlScene.RemoveNode(node)
+    # each file loads/saves markups and transform nodes; batching the scene state
+    # and pausing rendering around the loop suppresses per-node scene updates (same
+    # optimization as runMergeLandmarks). EndState/resumeRender must always run.
+    slicer.app.pauseRender()
+    slicer.mrmlScene.StartState(slicer.vtkMRMLScene.BatchProcessState)
+    try:
+      for lmFileName in sorted(os.listdir(landmarkDirectory)):
+        if lmFileName.startswith(".") or not lmFileName.endswith((".fcsv", ".json")):
+          continue
+        base = Path(lmFileName)
+        while base.suffix in {'.fcsv', '.mrk', '.json'}:
+          base = base.with_suffix('')
+        transformKey = str(base)
+        if transformSuffix and transformKey.endswith(transformSuffix):
+          transformKey = transformKey[:-len(transformSuffix)]
+        transformPath = os.path.join(transformDirectory, transformKey + ".h5")
+        if not os.path.exists(transformPath):
+          # expected for the atlas point set (no per-subject alignment); log for others
+          logging.info(f"DeCAL back-transform: no alignment transform for {lmFileName}, skipping")
+          continue
+        lmNode = xfNode = inverseNode = None
+        try:
+          lmNode = slicer.util.loadMarkups(os.path.join(landmarkDirectory, lmFileName))
+          xfNode = slicer.util.loadTransform(transformPath)
+          forwardMatrix = vtk.vtkMatrix4x4()
+          if not xfNode.GetMatrixTransformToParent(forwardMatrix):
+            raise ValueError("alignment transform is not linear")
+          inverseMatrix = vtk.vtkMatrix4x4()
+          vtk.vtkMatrix4x4.Invert(forwardMatrix, inverseMatrix)
+          inverseNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "DeCALInverseTransform")
+          inverseNode.SetMatrixTransformToParent(inverseMatrix)
+          lmNode.SetAndObserveTransformNodeID(inverseNode.GetID())
+          slicer.vtkSlicerTransformLogic().hardenTransform(lmNode)
+          slicer.util.saveNode(lmNode, os.path.join(outputDirectory, lmFileName))
+          writtenCount += 1
+        except Exception as e:
+          logging.warning(f"DeCAL back-transform: skipping {lmFileName} ({e})")
+        finally:
+          for node in (lmNode, xfNode, inverseNode):
+            if node is not None:
+              slicer.mrmlScene.RemoveNode(node)
+    finally:
+      slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
+      slicer.app.resumeRender()
     return writtenCount
 
   def downsampleModel(self, model, spacingPercentage):
