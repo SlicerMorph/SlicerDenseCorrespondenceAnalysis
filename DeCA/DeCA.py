@@ -321,6 +321,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCALWidgetLayout.addRow("Generate merged point lists: ", self.mergeLandmarksCheckBoxDCL)
 
     #
+    # Also output landmarks in the original (un-aligned) model coordinate frame
+    #
+    self.originalFrameCheckBoxDCL = qt.QCheckBox()
+    self.originalFrameCheckBoxDCL.checked = True
+    self.originalFrameCheckBoxDCL.setToolTip("If checked, the generated semi-landmarks (and merged point lists) are also written in the original, un-aligned coordinate frame of each input model, by inverting the alignment that mapped the subject onto the atlas. Saved to 'DeCALOutput_originalFrame' (and 'mergedLMs_originalFrame').")
+    DeCALWidgetLayout.addRow("Output landmarks in original frame: ", self.originalFrameCheckBoxDCL)
+
+    #
     # Apply Button
     #
     self.DCLApplyButton = qt.QPushButton("Run DeCAL")
@@ -460,6 +468,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
         DeCALOutputFolder = os.path.join(outputFolderDC, "DeCALOutput")
         os.makedirs(DeCALOutputFolder)
         fileNameDictionary['DeCALOutput'] = str(DeCALOutputFolder)
+        # per-subject alignment transforms are saved here so DeCAL output can later
+        # be mapped back into each subject's original (un-aligned) coordinate frame
+        alignmentTransformFolder = os.path.join(outputFolderDC, "alignmentTransforms")
+        os.makedirs(alignmentTransformFolder)
+        fileNameDictionary['alignmentTransforms'] = str(alignmentTransformFolder)
     except:
       logging.debug('Result directory failed: Could not create output folder')
     return fileNameDictionary
@@ -689,8 +702,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     # rigidly align to template
     self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
     removeScale = True
+    # only persist per-subject alignment transforms when original-frame output is
+    # requested, so an unchecked run does no extra transform I/O
+    transformDirectory = self.folderNames['alignmentTransforms'] if self.originalFrameCheckBoxDCL.checked else None
     try:
-      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale)
+      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale, transformDirectory=transformDirectory)
     except ValueError as errorText:
       self.logInfoDCL.appendPlainText(str(errorText))
       return
@@ -700,8 +716,9 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value)
     # optionally merge the generated semi-landmarks with the fixed landmarks used
     # to establish correspondence (both are in the atlas-aligned coordinate frame)
+    mergedCount = None
+    mergedDirectory = os.path.join(self.folderNames['output'], "mergedLMs")
     if self.mergeLandmarksCheckBoxDCL.checked:
-      mergedDirectory = os.path.join(self.folderNames['output'], "mergedLMs")
       try:
         os.makedirs(mergedDirectory, exist_ok=True)
       except OSError:
@@ -714,6 +731,18 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
           self.logInfoDCL.appendPlainText("Merge skipped: the SlicerMorph extension (MergeMarkups module) is required. Please install SlicerMorph.")
         else:
           self.logInfoDCL.appendPlainText(f"Saved {mergedCount} merged landmark files.")
+    # optionally also express the output in each subject's original (un-aligned)
+    # coordinate frame by inverting the saved per-subject alignment transform
+    if self.originalFrameCheckBoxDCL.checked:
+      originalSemiDirectory = os.path.join(self.folderNames['output'], "DeCALOutput_originalFrame")
+      self.logInfoDCL.appendPlainText(f"Mapping semi-landmarks back to the original model coordinate frame")
+      semiCount = logic.runBackTransformLandmarks(self.folderNames['DeCALOutput'], transformDirectory, originalSemiDirectory)
+      self.logInfoDCL.appendPlainText(f"Saved {semiCount} original-frame semi-landmark files to {originalSemiDirectory}")
+      # if merged files were produced, back-transform them too (descriptions preserved)
+      if mergedCount:
+        mergedOriginalDirectory = os.path.join(self.folderNames['output'], "mergedLMs_originalFrame")
+        mergedOriginalCount = logic.runBackTransformLandmarks(mergedDirectory, transformDirectory, mergedOriginalDirectory, "_merged")
+        self.logInfoDCL.appendPlainText(f"Saved {mergedOriginalCount} original-frame merged landmark files to {mergedOriginalDirectory}")
     # setup for optional subsetting
     self.pointSelection.setCurrentNode(atlasDenseLandmarks)
     self.DCLLandmarkDirectory.setCurrentPath(self.folderNames['DeCALOutput'])
@@ -1042,6 +1071,64 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       slicer.app.resumeRender()
     return mergedCount
 
+  def runBackTransformLandmarks(self, landmarkDirectory, transformDirectory, outputDirectory, transformSuffix=""):
+    # Map each aligned-frame landmark file in landmarkDirectory back into the
+    # original (pre-alignment) coordinate frame of its subject by inverting the
+    # per-subject similarity/rigid transform saved by runAlign. The transform is
+    # matched by the landmark file's basename (optionally with transformSuffix
+    # removed, e.g. "_merged"). Files with no matching transform - notably the
+    # atlas point set, which is already the reference frame - are skipped.
+    # Returns the number of files written.
+    if not os.path.isdir(landmarkDirectory):
+      return 0
+    os.makedirs(outputDirectory, exist_ok=True)
+    writtenCount = 0
+    # each file loads/saves markups and transform nodes; batching the scene state
+    # and pausing rendering around the loop suppresses per-node scene updates (same
+    # optimization as runMergeLandmarks). EndState/resumeRender must always run.
+    slicer.app.pauseRender()
+    slicer.mrmlScene.StartState(slicer.vtkMRMLScene.BatchProcessState)
+    try:
+      for lmFileName in sorted(os.listdir(landmarkDirectory)):
+        if lmFileName.startswith(".") or not lmFileName.endswith((".fcsv", ".json")):
+          continue
+        base = Path(lmFileName)
+        while base.suffix in {'.fcsv', '.mrk', '.json'}:
+          base = base.with_suffix('')
+        transformKey = str(base)
+        if transformSuffix and transformKey.endswith(transformSuffix):
+          transformKey = transformKey[:-len(transformSuffix)]
+        transformPath = os.path.join(transformDirectory, transformKey + ".h5")
+        if not os.path.exists(transformPath):
+          # expected for the atlas point set (no per-subject alignment); log for others
+          logging.info(f"DeCAL back-transform: no alignment transform for {lmFileName}, skipping")
+          continue
+        lmNode = xfNode = inverseNode = None
+        try:
+          lmNode = slicer.util.loadMarkups(os.path.join(landmarkDirectory, lmFileName))
+          xfNode = slicer.util.loadTransform(transformPath)
+          forwardMatrix = vtk.vtkMatrix4x4()
+          if not xfNode.GetMatrixTransformToParent(forwardMatrix):
+            raise ValueError("alignment transform is not linear")
+          inverseMatrix = vtk.vtkMatrix4x4()
+          vtk.vtkMatrix4x4.Invert(forwardMatrix, inverseMatrix)
+          inverseNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "DeCALInverseTransform")
+          inverseNode.SetMatrixTransformToParent(inverseMatrix)
+          lmNode.SetAndObserveTransformNodeID(inverseNode.GetID())
+          slicer.vtkSlicerTransformLogic().hardenTransform(lmNode)
+          slicer.util.saveNode(lmNode, os.path.join(outputDirectory, lmFileName))
+          writtenCount += 1
+        except Exception as e:
+          logging.warning(f"DeCAL back-transform: skipping {lmFileName} ({e})")
+        finally:
+          for node in (lmNode, xfNode, inverseNode):
+            if node is not None:
+              slicer.mrmlScene.RemoveNode(node)
+    finally:
+      slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
+      slicer.app.resumeRender()
+    return writtenCount
+
   def downsampleModel(self, model, spacingPercentage):
     points=model.GetPolyData()
     cleanFilter=vtk.vtkCleanPolyData()
@@ -1250,7 +1337,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         currentNode = slicer.util.loadModel(filePath)
         return currentNode
 
-  def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False):
+  def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False, transformDirectory=None):
     semilandmarkOption = bool(slmDirectory and outputSLMDirectory)
     targetPoints = vtk.vtkPoints()
     point=[0,0,0]
@@ -1300,6 +1387,19 @@ class DeCALogic(ScriptedLoadableModuleLogic):
           outputLMName = subjectID + '_align.mrk.json'
           outputLMPath = os.path.join(outputLMDirectory, outputLMName)
           slicer.util.saveNode(currentLMNode, outputLMPath)
+          # persist the (linear) alignment transform so downstream output can be
+          # mapped back to this subject's original coordinate frame by inverting it.
+          # The transform is keyed by the aligned output basename (subjectID + '_align')
+          # so it matches the DeCAL output landmark filenames. See runBackTransformLandmarks.
+          if transformDirectory:
+            transform.Update()
+            alignMatrix = vtk.vtkMatrix4x4()
+            alignMatrix.DeepCopy(transform.GetMatrix())
+            alignXfNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", subjectID + "_alignTransform")
+            alignXfNode.SetMatrixTransformToParent(alignMatrix)
+            transformPath = os.path.join(transformDirectory, subjectID + "_align.h5")
+            slicer.util.saveNode(alignXfNode, transformPath)
+            slicer.mrmlScene.RemoveNode(alignXfNode)
           # optional semi-landmark alignment
           if semilandmarkOption :
             currentSLMNode = self.getLandmarkFileByID(slmDirectory, subjectID)
