@@ -1023,6 +1023,17 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     Uses ScriptedLoadableModuleLogic base class, available at:
     https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
     """
+
+  # Phase 2 (issue #15) performance opt-in. When False (default), the dense
+  # correspondence step uses the exact vtkCellLocator closest-point-on-surface
+  # query. When True, it uses a vectorized scipy cKDTree nearest-VERTEX query,
+  # which is much faster but approximate (snaps to the nearest target vertex
+  # instead of the closest point on a triangle). Class-level so it applies to the
+  # internal DeCALogic() instances created deep in the atlas-build call chain;
+  # set DeCALogic.useFastCorrespondence = True (or logic.useFastCorrespondence)
+  # to opt in. Kept default-off until the approximation is validated.
+  useFastCorrespondence = False
+
   def runSubsetLandmarks(self, baseNode, lmDirectory, lmDirectorySubset):
     deletionIndex = []
     for i in range(baseNode.GetNumberOfControlPoints()):
@@ -1738,6 +1749,47 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     meanTransformBaseFilter.Update()
     return meanTransformBaseFilter.GetOutput()
 
+  def _closestPointsToMesh(self, queryPoints, targetMesh):
+    # For each point in queryPoints (vtkPoints), return the corresponding point
+    # relative to targetMesh (vtkPolyData) as a new vtkPoints, index-aligned.
+    #
+    # Default (exact): closest point on the target *surface* via vtkCellLocator,
+    # looping per point in Python.
+    # Fast (self.useFastCorrespondence): nearest target *vertex* via a single
+    # vectorized scipy cKDTree query. Much faster but approximate; see issue #15.
+    if self.useFastCorrespondence:
+      try:
+        from scipy.spatial import cKDTree
+      except ImportError:
+        slicer.util.pip_install('scipy')
+        from scipy.spatial import cKDTree
+      targetXYZ = vtk_np.vtk_to_numpy(targetMesh.GetPoints().GetData())
+      queryXYZ = vtk_np.vtk_to_numpy(queryPoints.GetData())
+      tree = cKDTree(targetXYZ)
+      try:
+        _, matchedIndices = tree.query(queryXYZ, k=1, workers=-1)
+      except TypeError:  # older scipy without the workers kwarg
+        _, matchedIndices = tree.query(queryXYZ, k=1)
+      matchedXYZ = np.ascontiguousarray(targetXYZ[matchedIndices])
+      correspondingPoints = vtk.vtkPoints()
+      correspondingPoints.SetData(vtk_np.numpy_to_vtk(matchedXYZ, deep=True))
+      return correspondingPoints
+
+    cellLocator = vtk.vtkCellLocator()
+    cellLocator.SetDataSet(targetMesh)
+    cellLocator.BuildLocator()
+    point = [0,0,0]
+    correspondingPoint = [0,0,0]
+    correspondingPoints = vtk.vtkPoints()
+    cellId = vtk.reference(0)
+    subId = vtk.reference(0)
+    distance = vtk.reference(0.0)
+    for i in range(queryPoints.GetNumberOfPoints()):
+      queryPoints.GetPoint(i, point)
+      cellLocator.FindClosestPoint(point, correspondingPoint, cellId, subId, distance)
+      correspondingPoints.InsertPoint(i, correspondingPoint)
+    return correspondingPoints
+
   def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration):
     # TPS warp target mesh to meanshape. meanWarpedBase (the base mesh already
     # warped onto the mean shape) is supplied by the caller, computed once via
@@ -1770,20 +1822,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       plyWriterBase.Write()
 
     # Dense correspondence
-    cellLocator = vtk.vtkCellLocator()
-    cellLocator.SetDataSet(meanWarpedMesh)
-    cellLocator.BuildLocator()
-
-    point = [0,0,0]
-    correspondingPoint = [0,0,0]
-    correspondingPoints = vtk.vtkPoints()
-    cellId = vtk.reference(0)
-    subId = vtk.reference(0)
-    distance = vtk.reference(0.0)
-    for i in range(meanWarpedBase.GetNumberOfPoints()):
-      meanWarpedBase.GetPoint(i,point)
-      cellLocator.FindClosestPoint(point,correspondingPoint,cellId, subId, distance)
-      correspondingPoints.InsertPoint(i,correspondingPoint)
+    correspondingPoints = self._closestPointsToMesh(meanWarpedBase.GetPoints(), meanWarpedMesh)
 
     #Copy points into mesh with base connectivity
     correspondingMesh = vtk.vtkPolyData()
