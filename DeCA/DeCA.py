@@ -48,6 +48,13 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
   def setup(self):
     ScriptedLoadableModuleWidget.setup(self)
 
+    # Shared re-entrancy guard: the long-running handlers pump the Qt event loop
+    # (via progressCallback) so their progress bars update, which also lets a click
+    # on a different tab's trigger button be dispatched mid-run. All three run
+    # handlers share self.folderNames / self.atlasModel state, so a re-entrant call
+    # would corrupt an in-flight run. Each handler no-ops while this flag is set.
+    self._busy = False
+
     # Set up tabs to split workflow
     tabsWidget = qt.QTabWidget()
     DeCATab = qt.QWidget()
@@ -196,6 +203,16 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCAWidgetLayout.addRow(self.applyButtonDC)
 
     #
+    # Progress bar
+    #
+    self.progressBarDC = qt.QProgressBar()
+    self.progressBarDC.minimum = 0
+    self.progressBarDC.maximum = 1
+    self.progressBarDC.value = 0
+    self.progressBarDC.setFormat("Idle")
+    DeCAWidgetLayout.addRow(self.progressBarDC)
+
+    #
     # Log Information
     #
     self.logInfoDC = qt.QPlainTextEdit()
@@ -335,6 +352,16 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.DCLApplyButton.toolTip = "Generate a set of corresponding landmarks"
     self.DCLApplyButton.enabled = False
     DeCALWidgetLayout.addRow(self.DCLApplyButton)
+
+    #
+    # Progress bar
+    #
+    self.progressBarDCL = qt.QProgressBar()
+    self.progressBarDCL.minimum = 0
+    self.progressBarDCL.maximum = 1
+    self.progressBarDCL.value = 0
+    self.progressBarDCL.setFormat("Idle")
+    DeCALWidgetLayout.addRow(self.progressBarDCL)
 
     #
     # Log Information
@@ -477,6 +504,26 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       logging.debug('Result directory failed: Could not create output folder')
     return fileNameDictionary
 
+  def makeProgressCallback(self, progressBar):
+    # Returns a progressCallback(current, total, message) that updates the given
+    # QProgressBar and pumps the Qt event loop so the UI stays responsive during
+    # long single-threaded per-subject loops (atlas building, dense correspondence)
+    # instead of appearing to stall.
+    def progressCallback(current, total, message):
+      total = max(total, 1)
+      progressBar.minimum = 0
+      progressBar.maximum = total
+      progressBar.value = current
+      progressBar.setFormat(f"{message}: {current}/{total}")
+      slicer.app.processEvents()
+    return progressCallback
+
+  def resetProgressBar(self, progressBar, message="Idle"):
+    progressBar.minimum = 0
+    progressBar.maximum = 1
+    progressBar.value = 0
+    progressBar.setFormat(message)
+
   def onToggleAnalysis(self):
     if self.analysisTypeSymmetry.checked == True:
       self.symmetryCollapsibleButton.collapsed = False
@@ -545,40 +592,52 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.subsetApplyButton.enabled = bool(self.DCLLandmarkDirectory.currentPath and self.pointSelection.currentNode())
 
   def onGenerateAtlasButton(self):
-    logic = DeCALogic()
-    #set up output directory
-    self.folderNames = self.setUpDeCADir(self.OutputDirectoryDCL.currentPath, False, False, True, self.loadAtlasOptionDCL.checked)
-    if self.folderNames == {}:
-      self.logInfoDCL.appendPlainText(f'Output folders could not be created in {self.OutputDirectoryDCL.currentPath}')
+    if self._busy:
       return
-    self.folderNames['originalLMs'] = self.landmarkDirectoryDCL.currentPath
-    self.folderNames['originalModels'] = self.meshDirectoryDCL.currentPath
-    if self.loadAtlasOptionDCL.checked:
-      try:
-        atlasModelPath = self.DCLBaseModelSelector.currentPath
-        self.atlasModel = slicer.util.loadModel(atlasModelPath)
-      except:
-        self.logInfoDCL.appendPlainText(f"Can't load model from: {atlasModelPath}")
+    self._busy = True
+    self.getAtlasButton.enabled = False
+    succeeded = False
+    try:
+      logic = DeCALogic()
+      progressCallback = self.makeProgressCallback(self.progressBarDCL)
+      #set up output directory
+      self.folderNames = self.setUpDeCADir(self.OutputDirectoryDCL.currentPath, False, False, True, self.loadAtlasOptionDCL.checked)
+      if self.folderNames == {}:
+        self.logInfoDCL.appendPlainText(f'Output folders could not be created in {self.OutputDirectoryDCL.currentPath}')
         return
-      try:
-        atlasLMPath = self.DCLBaseLMSelector.currentPath
-        self.atlasLMs = slicer.util.loadMarkups(atlasLMPath)
-      except:
-        print("Can't load from: ", atlasLMPath)
-        self.logInfoDCL.appendPlainText(f"Can't load landmarks from: {atlasLMPath}")
-        return
-    else:
-      removeScale = True
-      self.atlasModel, self.atlasLMs = self.generateNewAtlas(removeScale, self.logInfoDCL)
-    atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
-    self.logInfoDCL.appendPlainText(f"Saving atlas model to {atlasModelPath}")
-    slicer.util.saveNode(self.atlasModel, atlasModelPath)
-    atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
-    self.logInfoDCL.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
-    slicer.util.saveNode(self.atlasLMs, atlasLMPath)
-    self.getPointNumberButton.enabled = True
+      self.folderNames['originalLMs'] = self.landmarkDirectoryDCL.currentPath
+      self.folderNames['originalModels'] = self.meshDirectoryDCL.currentPath
+      if self.loadAtlasOptionDCL.checked:
+        try:
+          atlasModelPath = self.DCLBaseModelSelector.currentPath
+          self.atlasModel = slicer.util.loadModel(atlasModelPath)
+        except:
+          self.logInfoDCL.appendPlainText(f"Can't load model from: {atlasModelPath}")
+          return
+        try:
+          atlasLMPath = self.DCLBaseLMSelector.currentPath
+          self.atlasLMs = slicer.util.loadMarkups(atlasLMPath)
+        except:
+          print("Can't load from: ", atlasLMPath)
+          self.logInfoDCL.appendPlainText(f"Can't load landmarks from: {atlasLMPath}")
+          return
+      else:
+        removeScale = True
+        self.atlasModel, self.atlasLMs = self.generateNewAtlas(removeScale, self.logInfoDCL, progressCallback)
+      atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
+      self.logInfoDCL.appendPlainText(f"Saving atlas model to {atlasModelPath}")
+      slicer.util.saveNode(self.atlasModel, atlasModelPath)
+      atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
+      self.logInfoDCL.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
+      slicer.util.saveNode(self.atlasLMs, atlasLMPath)
+      self.getPointNumberButton.enabled = True
+      succeeded = True
+    finally:
+      self._busy = False
+      self.getAtlasButton.enabled = True
+      self.resetProgressBar(self.progressBarDCL, "Atlas ready" if succeeded else "Idle")
 
-  def generateNewAtlas(self, removeScale, log):
+  def generateNewAtlas(self, removeScale, log, progressCallback=None):
     logic = DeCALogic()
     closestToMeanLandmarkPath = logic.getClosestToMeanPath(self.folderNames['originalLMs'])
     tempBaseLMs = slicer.util.loadMarkups(os.path.join(self.folderNames['originalLMs'],closestToMeanLandmarkPath))
@@ -588,12 +647,12 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     log.appendPlainText(f"Sample selected for rigid alignment: {subjectID}")
     tempBaseModel = logic.getModelFileByID(self.folderNames['originalModels'], subjectID)
     try:
-      logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale)
+      logic.runAlign(tempBaseModel, tempBaseLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['tempAlignedModels'], self.folderNames['tempAlignedLMs'], removeScale, progressCallback=progressCallback)
     except ValueError as errorText:
       log.appendPlainText(str(errorText))
       return
     log.appendPlainText(f"Generating the average template")
-    atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'], log)
+    atlasModel, atlasLMs = logic.runMean(self.folderNames['tempAlignedLMs'], self.folderNames['tempAlignedModels'], log, progressCallback)
     slicer.mrmlScene.RemoveNode(tempBaseModel)
     slicer.mrmlScene.RemoveNode(tempBaseLMs)
     shutil.rmtree(self.folderNames['tempAlignedModels'])
@@ -607,145 +666,169 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.DCLApplyButton.enabled = True
 
   def onDCApplyButton(self):
-    logic = DeCALogic()
-    #set up output directory
-    symmetryOption = self.analysisTypeSymmetry.checked
-    writeErrorOption = self.writeErrorCheckBox.checked
-    loadAtlasOption = self.loadAtlasOptionDC.checked
-    removeScaleOption = self.removeScaleCheckBoxDC.checked
-    
-    # Validate symmetry inputs BEFORE running any pipeline steps
-    if symmetryOption:
-      # First, get the expected landmark count from the files
-      try:
-        expected_landmark_count = self.getActualLandmarkCount(self.landmarkDirectoryDC.currentPath)
-      except Exception as e:
-        self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
-        print(f"DeCA Symmetry Error: {str(e)}")
-        return # Stop execution before any processing
-      
-      # Now validate and generate the mirror map with the expected count
-      try:
-        mirror_map_string = self.generateMirrorMapString(expected_landmark_count)
-        self.logInfoDC.appendPlainText(f"Symmetry validation passed. All {expected_landmark_count} landmarks specified.")
-      except Exception as e:
-        self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
-        print(f"DeCA Symmetry Error: {str(e)}")
-        return # Stop execution before any processing
-    
-    self.folderNames = self.setUpDeCADir(self.outputDirectoryDC.currentPath, symmetryOption, writeErrorOption, False, loadAtlasOption)
-    if self.folderNames == {}:
-      self.logInfoDC.appendPlainText(f'Output folders could not be created in {self.outputDirectoryDC.currentPath}')
+    if self._busy:
       return
-    self.folderNames['originalLMs'] = self.landmarkDirectoryDC.currentPath
-    self.folderNames['originalModels'] = self.meshDirectoryDC.currentPath
-    
-    #generate or load atlas
-    if loadAtlasOption:
-      try:
-        atlasModelPath = self.DCBaseModelSelector.currentPath
-        self.atlasModel = slicer.util.loadModel(atlasModelPath)
-      except:
-        self.logInfoDC.appendPlainText(f"Can't load model from: {atlasModelPath}")
-        return
-      try:
-        atlasLMPath = self.DCBaseLMSelector.currentPath
-        self.atlasLMs = slicer.util.loadMarkups(atlasLMPath)
-      except:
-        print("Can't load from: ", atlasLMPath)
-        self.logInfoDC.appendPlainText(f"Can't load landmarks from: {atlasLMPath}")
-        return
-    else:
-      self.atlasModel, self.atlasLMs = self.generateNewAtlas(removeScaleOption, self.logInfoDC)
-    # save atlas model and landmarks to output file
-    atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
-    self.logInfoDC.appendPlainText(f"Saving atlas model to {atlasModelPath}")
-    slicer.util.saveNode(self.atlasModel, atlasModelPath)
-    atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
-    self.logInfoDC.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
-    slicer.util.saveNode(self.atlasLMs, atlasLMPath)
-    # rigid alignment to atlas
+    self._busy = True
+    self.applyButtonDC.enabled = False
+    succeeded = False
     try:
-      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScaleOption)
-    except ValueError as errorText:
-      self.logInfoDC.appendPlainText(str(errorText))
-      return
-    # run DeCA shape analysis
-    if self.analysisTypeShape.checked:
-      self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
-      logic.runDCAlign(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
-      self.folderNames['alignedLMs'], self.folderNames['output'], self.writeErrorCheckBox.checked)
-    # run DeCA symmetry analysis
-    else:
-      ##
-      ## MODIFIED SECTION: Use the mirror map string already validated and generated at start
-      ##
-      # generate mirrored landmarks and models
-      axis = [-1,1,1] #set symmetry to x-axis
-      
-      # mirror_map_string was already generated and validated at the start of onDCApplyButton
-      self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
-      logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
-      self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the validated string
-      self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
-      logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
-      self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
-      self.writeErrorCheckBox.checked)
-      ##
-      ## END OF MODIFIED SECTION
-      ##
-    slicer.mrmlScene.RemoveNode(self.atlasModel)
-    slicer.mrmlScene.RemoveNode(self.atlasLMs)
+      logic = DeCALogic()
+      progressCallback = self.makeProgressCallback(self.progressBarDC)
+      #set up output directory
+      symmetryOption = self.analysisTypeSymmetry.checked
+      writeErrorOption = self.writeErrorCheckBox.checked
+      loadAtlasOption = self.loadAtlasOptionDC.checked
+      removeScaleOption = self.removeScaleCheckBoxDC.checked
+
+      # Validate symmetry inputs BEFORE running any pipeline steps
+      if symmetryOption:
+        # First, get the expected landmark count from the files
+        try:
+          expected_landmark_count = self.getActualLandmarkCount(self.landmarkDirectoryDC.currentPath)
+        except Exception as e:
+          self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
+          print(f"DeCA Symmetry Error: {str(e)}")
+          return # Stop execution before any processing
+
+        # Now validate and generate the mirror map with the expected count
+        try:
+          mirror_map_string = self.generateMirrorMapString(expected_landmark_count)
+          self.logInfoDC.appendPlainText(f"Symmetry validation passed. All {expected_landmark_count} landmarks specified.")
+        except Exception as e:
+          self.logInfoDC.appendPlainText(f"Symmetry Error: {str(e)}")
+          print(f"DeCA Symmetry Error: {str(e)}")
+          return # Stop execution before any processing
+
+      self.folderNames = self.setUpDeCADir(self.outputDirectoryDC.currentPath, symmetryOption, writeErrorOption, False, loadAtlasOption)
+      if self.folderNames == {}:
+        self.logInfoDC.appendPlainText(f'Output folders could not be created in {self.outputDirectoryDC.currentPath}')
+        return
+      self.folderNames['originalLMs'] = self.landmarkDirectoryDC.currentPath
+      self.folderNames['originalModels'] = self.meshDirectoryDC.currentPath
+
+      #generate or load atlas
+      if loadAtlasOption:
+        try:
+          atlasModelPath = self.DCBaseModelSelector.currentPath
+          self.atlasModel = slicer.util.loadModel(atlasModelPath)
+        except:
+          self.logInfoDC.appendPlainText(f"Can't load model from: {atlasModelPath}")
+          return
+        try:
+          atlasLMPath = self.DCBaseLMSelector.currentPath
+          self.atlasLMs = slicer.util.loadMarkups(atlasLMPath)
+        except:
+          print("Can't load from: ", atlasLMPath)
+          self.logInfoDC.appendPlainText(f"Can't load landmarks from: {atlasLMPath}")
+          return
+      else:
+        self.atlasModel, self.atlasLMs = self.generateNewAtlas(removeScaleOption, self.logInfoDC, progressCallback)
+      # save atlas model and landmarks to output file
+      atlasModelPath = os.path.join(self.folderNames['output'], 'decaAtlasModel.ply')
+      self.logInfoDC.appendPlainText(f"Saving atlas model to {atlasModelPath}")
+      slicer.util.saveNode(self.atlasModel, atlasModelPath)
+      atlasLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
+      self.logInfoDC.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
+      slicer.util.saveNode(self.atlasLMs, atlasLMPath)
+      # rigid alignment to atlas
+      try:
+        logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'], self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScaleOption, progressCallback=progressCallback)
+      except ValueError as errorText:
+        self.logInfoDC.appendPlainText(str(errorText))
+        return
+      # run DeCA shape analysis
+      if self.analysisTypeShape.checked:
+        self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
+        logic.runDCAlign(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
+        self.folderNames['alignedLMs'], self.folderNames['output'], self.writeErrorCheckBox.checked, progressCallback)
+      # run DeCA symmetry analysis
+      else:
+        ##
+        ## MODIFIED SECTION: Use the mirror map string already validated and generated at start
+        ##
+        # generate mirrored landmarks and models
+        axis = [-1,1,1] #set symmetry to x-axis
+
+        # mirror_map_string was already generated and validated at the start of onDCApplyButton
+        self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
+        logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
+        self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the validated string
+        self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
+        logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
+        self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
+        self.writeErrorCheckBox.checked, progressCallback)
+        ##
+        ## END OF MODIFIED SECTION
+        ##
+      slicer.mrmlScene.RemoveNode(self.atlasModel)
+      slicer.mrmlScene.RemoveNode(self.atlasLMs)
+      succeeded = True
+    finally:
+      self._busy = False
+      self.applyButtonDC.enabled = True
+      self.resetProgressBar(self.progressBarDC, "Done" if succeeded else "Idle")
 
   def onDCLApplyButton(self):
-    logic = DeCALogic()
-    # rigidly align to template
-    self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
-    removeScale = True
-    # only persist per-subject alignment transforms when original-frame output is
-    # requested, so an unchecked run does no extra transform I/O
-    transformDirectory = self.folderNames['alignmentTransforms'] if self.originalFrameCheckBoxDCL.checked else None
-    try:
-      logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale, transformDirectory=transformDirectory)
-    except ValueError as errorText:
-      self.logInfoDCL.appendPlainText(str(errorText))
+    if self._busy:
       return
-    # generate point correspondences
-    self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
-    atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
-    self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value)
-    # optionally merge the generated semi-landmarks with the fixed landmarks used
-    # to establish correspondence (both are in the atlas-aligned coordinate frame)
-    mergedCount = None
-    mergedDirectory = os.path.join(self.folderNames['output'], "mergedLMs")
-    if self.mergeLandmarksCheckBoxDCL.checked:
+    self._busy = True
+    self.DCLApplyButton.enabled = False
+    succeeded = False
+    try:
+      logic = DeCALogic()
+      progressCallback = self.makeProgressCallback(self.progressBarDCL)
+      # rigidly align to template
+      self.logInfoDCL.appendPlainText(f"Rigid alignment to the atlas")
+      removeScale = True
+      # only persist per-subject alignment transforms when original-frame output is
+      # requested, so an unchecked run does no extra transform I/O
+      transformDirectory = self.folderNames['alignmentTransforms'] if self.originalFrameCheckBoxDCL.checked else None
       try:
-        os.makedirs(mergedDirectory, exist_ok=True)
-      except OSError:
-        self.logInfoDCL.appendPlainText(f"Could not create merged landmark folder: {mergedDirectory}")
-      else:
-        self.logInfoDCL.appendPlainText(f"Merging fixed and semi-landmarks into {mergedDirectory}")
-        atlasFixedLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
-        mergedCount = logic.runMergeLandmarks(self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], mergedDirectory, atlasFixedLMPath)
-        if mergedCount is None:
-          self.logInfoDCL.appendPlainText("Merge skipped: the SlicerMorph extension (MergeMarkups module) is required. Please install SlicerMorph.")
+        logic.runAlign(self.atlasModel, self.atlasLMs, self.folderNames['originalModels'], self.folderNames['originalLMs'],self.folderNames['alignedModels'], self.folderNames['alignedLMs'], removeScale, transformDirectory=transformDirectory, progressCallback=progressCallback)
+      except ValueError as errorText:
+        self.logInfoDCL.appendPlainText(str(errorText))
+        return
+      # generate point correspondences
+      self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
+      atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
+      self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback)
+      # optionally merge the generated semi-landmarks with the fixed landmarks used
+      # to establish correspondence (both are in the atlas-aligned coordinate frame)
+      mergedCount = None
+      mergedDirectory = os.path.join(self.folderNames['output'], "mergedLMs")
+      if self.mergeLandmarksCheckBoxDCL.checked:
+        try:
+          os.makedirs(mergedDirectory, exist_ok=True)
+        except OSError:
+          self.logInfoDCL.appendPlainText(f"Could not create merged landmark folder: {mergedDirectory}")
         else:
-          self.logInfoDCL.appendPlainText(f"Saved {mergedCount} merged landmark files.")
-    # optionally also express the output in each subject's original (un-aligned)
-    # coordinate frame by inverting the saved per-subject alignment transform
-    if self.originalFrameCheckBoxDCL.checked:
-      originalSemiDirectory = os.path.join(self.folderNames['output'], "DeCALOutput_originalFrame")
-      self.logInfoDCL.appendPlainText(f"Mapping semi-landmarks back to the original model coordinate frame")
-      semiCount = logic.runBackTransformLandmarks(self.folderNames['DeCALOutput'], transformDirectory, originalSemiDirectory)
-      self.logInfoDCL.appendPlainText(f"Saved {semiCount} original-frame semi-landmark files to {originalSemiDirectory}")
-      # if merged files were produced, back-transform them too (descriptions preserved)
-      if mergedCount:
-        mergedOriginalDirectory = os.path.join(self.folderNames['output'], "mergedLMs_originalFrame")
-        mergedOriginalCount = logic.runBackTransformLandmarks(mergedDirectory, transformDirectory, mergedOriginalDirectory, "_merged")
-        self.logInfoDCL.appendPlainText(f"Saved {mergedOriginalCount} original-frame merged landmark files to {mergedOriginalDirectory}")
-    # setup for optional subsetting
-    self.pointSelection.setCurrentNode(atlasDenseLandmarks)
-    self.DCLLandmarkDirectory.setCurrentPath(self.folderNames['DeCALOutput'])
+          self.logInfoDCL.appendPlainText(f"Merging fixed and semi-landmarks into {mergedDirectory}")
+          atlasFixedLMPath = os.path.join(self.folderNames['output'], 'decaAtlasLM.mrk.json')
+          mergedCount = logic.runMergeLandmarks(self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], mergedDirectory, atlasFixedLMPath)
+          if mergedCount is None:
+            self.logInfoDCL.appendPlainText("Merge skipped: the SlicerMorph extension (MergeMarkups module) is required. Please install SlicerMorph.")
+          else:
+            self.logInfoDCL.appendPlainText(f"Saved {mergedCount} merged landmark files.")
+      # optionally also express the output in each subject's original (un-aligned)
+      # coordinate frame by inverting the saved per-subject alignment transform
+      if self.originalFrameCheckBoxDCL.checked:
+        originalSemiDirectory = os.path.join(self.folderNames['output'], "DeCALOutput_originalFrame")
+        self.logInfoDCL.appendPlainText(f"Mapping semi-landmarks back to the original model coordinate frame")
+        semiCount = logic.runBackTransformLandmarks(self.folderNames['DeCALOutput'], transformDirectory, originalSemiDirectory)
+        self.logInfoDCL.appendPlainText(f"Saved {semiCount} original-frame semi-landmark files to {originalSemiDirectory}")
+        # if merged files were produced, back-transform them too (descriptions preserved)
+        if mergedCount:
+          mergedOriginalDirectory = os.path.join(self.folderNames['output'], "mergedLMs_originalFrame")
+          mergedOriginalCount = logic.runBackTransformLandmarks(mergedDirectory, transformDirectory, mergedOriginalDirectory, "_merged")
+          self.logInfoDCL.appendPlainText(f"Saved {mergedOriginalCount} original-frame merged landmark files to {mergedOriginalDirectory}")
+      # setup for optional subsetting
+      self.pointSelection.setCurrentNode(atlasDenseLandmarks)
+      self.DCLLandmarkDirectory.setCurrentPath(self.folderNames['DeCALOutput'])
+      succeeded = True
+    finally:
+      self._busy = False
+      self.DCLApplyButton.enabled = True
+      self.resetProgressBar(self.progressBarDCL, "Done" if succeeded else "Idle")
 
   def onSubsetApplyButton(self):
     logic = DeCALogic()
@@ -958,15 +1041,15 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     templateModel = self.downsampleModel(atlasNode, spacingPercentage)
     return templateModel, templateModel.GetNumberOfPoints()
 
-  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance):
+  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None):
     spacingPercentage = spacingTolerance/100
     loadOption=False
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath, loadOption).GetPoints()
     modelExt=['ply','stl','vtp', 'vtk']
-    self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
-    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory)
+    self.modelNames, models = self.importMeshes(meshDirectory, modelExt, progressCallback)
+    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
     self.outputDirectory = outputDirectory
-    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseNode.GetPolyData(), baseLandmarks)
+    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseNode.GetPolyData(), baseLandmarks, progressCallback)
     # get downsampled template with index array
     indexArrayName = "indexArray"
     self.addIndexArray(baseNode, indexArrayName)
@@ -1260,7 +1343,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
           slicer.mrmlScene.RemoveNode(rigidTransformNode)
           slicer.mrmlScene.RemoveNode(mirrorLMNode)
 
-  def runDCAlign(self, baseMeshPath, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, optionErrorOutput):
+  def runDCAlign(self, baseMeshPath, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, optionErrorOutput, progressCallback=None):
     if optionErrorOutput:
       self.errorCheckPath = os.path.join(outputDirectory, "errorChecking")
       if not os.path.exists(self.errorCheckPath):
@@ -1269,16 +1352,16 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     baseMesh = baseNode.GetPolyData()
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath).GetPoints()
     modelExt=['ply','stl','vtp']
-    self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
-    landmarkNames,landmarks = self.importLandmarks(landmarkDirectory)
-    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks)
+    self.modelNames, models = self.importMeshes(meshDirectory, modelExt, progressCallback)
+    landmarkNames,landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
+    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks, progressCallback)
     self.addMagnitudeFeature(denseCorrespondenceGroup, self.modelNames, baseMesh)
     # save results to output directory
     outputModelName = 'decaResultModel.vtp'
     outputModelPath = os.path.join(outputDirectory, outputModelName)
     slicer.util.saveNode(baseNode, outputModelPath)
 
-  def runDCAlignSymmetric(self, baseMeshPath, baseLMPath, meshDir, landmarkDir, mirrorMeshDir, mirrorLandmarkDir, outputDir, optionErrorOutput):
+  def runDCAlignSymmetric(self, baseMeshPath, baseLMPath, meshDir, landmarkDir, mirrorMeshDir, mirrorLandmarkDir, outputDir, optionErrorOutput, progressCallback=None):
     if optionErrorOutput:
       self.errorCheckPath = os.path.join(outputDir, "errorChecking")
       if not os.path.exists(self.errorCheckPath):
@@ -1287,23 +1370,23 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     baseMesh = baseNode.GetPolyData()
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath).GetPoints()
     modelExt=['ply','stl','vtp']
-    self.modelNames, models = self.importMeshes(meshDir, modelExt)
-    landmarkNames, landmarks = self.importLandmarks(landmarkDir)
-    modelMirrorNames, mirrorModels = self.importMeshes(mirrorMeshDir, modelExt)
-    mirrorLandmarkNames, mirrorLandmarks = self.importLandmarks(mirrorLandmarkDir)
-    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks)
-    denseCorrespondenceGroupMirror = self.denseCorrespondenceBaseMesh(mirrorLandmarks, mirrorModels, baseMesh, baseLandmarks)
+    self.modelNames, models = self.importMeshes(meshDir, modelExt, progressCallback)
+    landmarkNames, landmarks = self.importLandmarks(landmarkDir, progressCallback)
+    modelMirrorNames, mirrorModels = self.importMeshes(mirrorMeshDir, modelExt, progressCallback)
+    mirrorLandmarkNames, mirrorLandmarks = self.importLandmarks(mirrorLandmarkDir, progressCallback)
+    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseMesh, baseLandmarks, progressCallback)
+    denseCorrespondenceGroupMirror = self.denseCorrespondenceBaseMesh(mirrorLandmarks, mirrorModels, baseMesh, baseLandmarks, progressCallback)
     self.addMagnitudeFeatureSymmetry(denseCorrespondenceGroup, denseCorrespondenceGroupMirror, self.modelNames, baseMesh)
     # save results to output directory
     outputModelName = 'decaSymmetryResultModel.vtp'
     outputModelPath = os.path.join(outputDir, outputModelName)
     slicer.util.saveNode(baseNode, outputModelPath)
 
-  def runMean(self, landmarkDirectory, meshDirectory, log=None):
+  def runMean(self, landmarkDirectory, meshDirectory, log=None, progressCallback=None):
     modelExt=['ply','stl','vtp','vtk']
-    self.modelNames, models = self.importMeshes(meshDirectory, modelExt)
-    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory)
-    [denseCorrespondenceGroup, closestToMeanIndex] = self.denseCorrespondence(landmarks, models)
+    self.modelNames, models = self.importMeshes(meshDirectory, modelExt, progressCallback)
+    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
+    [denseCorrespondenceGroup, closestToMeanIndex] = self.denseCorrespondence(landmarks, models, progressCallback=progressCallback)
     if log:
       log.appendPlainText(f"Sample selected for base model calculation: {self.modelNames[closestToMeanIndex]}")
     # compute mean model
@@ -1337,7 +1420,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         currentNode = slicer.util.loadModel(filePath)
         return currentNode
 
-  def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False, transformDirectory=None):
+  def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False, transformDirectory=None, progressCallback=None):
     semilandmarkOption = bool(slmDirectory and outputSLMDirectory)
     targetPoints = vtk.vtkPoints()
     point=[0,0,0]
@@ -1346,7 +1429,11 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       point = baseLMNode.GetNthControlPointPosition(i)
       targetPoints.InsertNextPoint(point)
     # Transform each subject to base
-    for meshFileName in os.listdir(meshDirectory):
+    subjectFileNames = [f for f in os.listdir(meshDirectory) if not f.startswith(".")]
+    subjectTotal = len(subjectFileNames)
+    for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
+      if progressCallback:
+        progressCallback(subjectCount, subjectTotal, "Rigid alignment")
       if(not meshFileName.startswith(".")):
         lmFileList = os.listdir(lmDirectory)
         meshFilePath = os.path.join(meshDirectory, meshFileName)
@@ -1467,31 +1554,37 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     slicer.mrmlScene.RemoveNode(fiducialNode)
     return polydataPoints
 
-  def importLandmarks(self, topDir):
+  def importLandmarks(self, topDir, progressCallback=None):
     fiducialGroup = vtk.vtkMultiBlockDataGroupFilter()
     fileNameList = []
-    for file in sorted(os.listdir(topDir)):
-      if file.endswith(".fcsv") or file.endswith(".json"):
-        fileNameList.append(file)
-        inputFilePath = os.path.join(topDir, file)
-        # may want to replace with vtk reader
-        polydataPoints = self.fiducialNodeToPolyData(inputFilePath)
-        fiducialGroup.AddInputData(polydataPoints)
+    landmarkFiles = [f for f in sorted(os.listdir(topDir)) if f.endswith(".fcsv") or f.endswith(".json")]
+    fileTotal = len(landmarkFiles)
+    for fileCount, file in enumerate(landmarkFiles, start=1):
+      if progressCallback:
+        progressCallback(fileCount, fileTotal, "Loading landmarks")
+      fileNameList.append(file)
+      inputFilePath = os.path.join(topDir, file)
+      # may want to replace with vtk reader
+      polydataPoints = self.fiducialNodeToPolyData(inputFilePath)
+      fiducialGroup.AddInputData(polydataPoints)
     fiducialGroup.Update()
     return fileNameList, fiducialGroup.GetOutput()
 
-  def importMeshes(self, topDir, extensions):
+  def importMeshes(self, topDir, extensions, progressCallback=None):
       modelGroup = vtk.vtkMultiBlockDataGroupFilter()
       fileNameList = []
-      for file in sorted(os.listdir(topDir)):
-        if file.endswith(tuple(extensions)):
-          base, ext = os.path.splitext(file)
-          fileNameList.append(base)
-          inputFilePath = os.path.join(topDir, file)
-          # may want to replace with vtk reader
-          modelNode = slicer.util.loadModel(inputFilePath)
-          modelGroup.AddInputData(modelNode.GetPolyData())
-          slicer.mrmlScene.RemoveNode(modelNode)
+      meshFiles = [f for f in sorted(os.listdir(topDir)) if f.endswith(tuple(extensions))]
+      fileTotal = len(meshFiles)
+      for fileCount, file in enumerate(meshFiles, start=1):
+        if progressCallback:
+          progressCallback(fileCount, fileTotal, "Loading meshes")
+        base, ext = os.path.splitext(file)
+        fileNameList.append(base)
+        inputFilePath = os.path.join(topDir, file)
+        # may want to replace with vtk reader
+        modelNode = slicer.util.loadModel(inputFilePath)
+        modelGroup.AddInputData(modelNode.GetPolyData())
+        slicer.mrmlScene.RemoveNode(modelNode)
       modelGroup.Update()
       return fileNameList, modelGroup.GetOutput()
 
@@ -1534,7 +1627,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       raise ValueError(f"Index mismatch: computed index {closestToMeanIndex} but only {len(lmNames)} landmarks available")
     return lmNames[closestToMeanIndex]
 
-  def denseCorrespondence(self, originalLandmarks, originalMeshes, writeErrorOption=False):
+  def denseCorrespondence(self, originalLandmarks, originalMeshes, writeErrorOption=False, progressCallback=None):
     meanShape, alignedPoints = self.procrustesImposition(originalLandmarks, False)
     sampleNumber = alignedPoints.GetNumberOfBlocks()
     denseCorrespondenceGroup = vtk.vtkMultiBlockDataGroupFilter()
@@ -1543,6 +1636,8 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     baseMesh = originalMeshes.GetBlock(baseIndex)
     baseLandmarks = originalLandmarks.GetBlock(baseIndex).GetPoints()
     for i in range(sampleNumber):
+      if progressCallback:
+        progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
       correspondingMesh = self.denseSurfaceCorrespondencePair(originalMeshes.GetBlock(i),
       originalLandmarks.GetBlock(i).GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
       baseMesh, baseLandmarks, meanShape, i)
@@ -1587,12 +1682,14 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     denseCorrespondenceGroup.Update()
     return denseCorrespondenceGroup.GetOutput()
 
-  def denseCorrespondenceBaseMesh(self, originalLandmarks, originalMeshes, baseMesh, baseLandmarks):
+  def denseCorrespondenceBaseMesh(self, originalLandmarks, originalMeshes, baseMesh, baseLandmarks, progressCallback=None):
     meanShape, alignedPoints = self.procrustesImposition(originalLandmarks, False)
     sampleNumber = alignedPoints.GetNumberOfBlocks()
     print("procrustes aligned samples: ", sampleNumber)
     denseCorrespondenceGroup = vtk.vtkMultiBlockDataGroupFilter()
     for i in range(sampleNumber):
+      if progressCallback:
+        progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
       correspondingMesh = self.denseSurfaceCorrespondencePair(originalMeshes.GetBlock(i),
       originalLandmarks.GetBlock(i).GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
       baseMesh, baseLandmarks, meanShape, i)
