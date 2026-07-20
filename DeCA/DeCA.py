@@ -1439,6 +1439,26 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         currentNode = slicer.util.loadModel(filePath)
         return currentNode
 
+  def _removeNodeFully(self, node):
+    # Remove a node together with the display and storage nodes that
+    # slicer.util.loadModel / loadMarkups create for it. A plain
+    # RemoveNode(node) leaves those associated nodes orphaned in the scene, and
+    # across a long per-subject loop they accumulate and progressively slow the
+    # scene (and its rendering) down.
+    if node is None:
+      return
+    associatedNodes = []
+    if node.IsA("vtkMRMLDisplayableNode"):
+      for i in range(node.GetNumberOfDisplayNodes()):
+        associatedNodes.append(node.GetNthDisplayNode(i))
+    if node.IsA("vtkMRMLStorableNode"):
+      for i in range(node.GetNumberOfStorageNodes()):
+        associatedNodes.append(node.GetNthStorageNode(i))
+    slicer.mrmlScene.RemoveNode(node)
+    for associatedNode in associatedNodes:
+      if associatedNode is not None:
+        slicer.mrmlScene.RemoveNode(associatedNode)
+
   def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False, transformDirectory=None, progressCallback=None):
     semilandmarkOption = bool(slmDirectory and outputSLMDirectory)
     targetPoints = vtk.vtkPoints()
@@ -1453,78 +1473,89 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     # Index the landmark directory once instead of re-listing it per subject
     # (avoids O(N^2) directory scans on large datasets / network storage).
     landmarkFileIndex = self.buildLandmarkFileIndex(lmDirectory)
-    for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
-      if progressCallback:
-        progressCallback(subjectCount, subjectTotal, "Rigid alignment")
-      if(not meshFileName.startswith(".")):
-        meshFilePath = os.path.join(meshDirectory, meshFileName)
-        subjectID = os.path.splitext(meshFileName)[0]
-        currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID, landmarkFileIndex)
-        if currentLMNode :
-          try:
-            currentMeshNode = slicer.util.loadModel(meshFilePath)
-          except:
-            slicer.mrmlScene.RemoveNode(currentLMNode)
-            continue
-          if currentLMNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
-            raise ValueError(f"Landmark points mismatch: subject has {currentLMNode.GetNumberOfControlPoints()} points, "
-              f"atlas has {baseLMNode.GetNumberOfControlPoints()} points")
-          # set up transform between base lms and current lms
-          sourcePoints = vtk.vtkPoints()
-          for i in range(currentLMNode.GetNumberOfControlPoints()):
-            point = currentLMNode.GetNthControlPointPosition(i)
-            sourcePoints.InsertNextPoint(point)
-            transform = vtk.vtkLandmarkTransform()
-            transform.SetSourceLandmarks(sourcePoints)
-            transform.SetTargetLandmarks(targetPoints)
-          if not removeScaleOption:
-            transform.SetModeToRigidBody()
-          else:
-            transform.SetModeToSimilarity()
-          transformNode=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode","Alignment")
-          transformNode.SetAndObserveTransformToParent(transform)
-          # apply transform to the current surface mesh and landmarks
-          currentMeshNode.SetAndObserveTransformNodeID(transformNode.GetID())
-          currentLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
-          slicer.vtkSlicerTransformLogic().hardenTransform(currentMeshNode)
-          slicer.vtkSlicerTransformLogic().hardenTransform(currentLMNode)
-          # save output files
-          outputMeshName = subjectID + '_align.ply'
-          outputMeshPath = os.path.join(ouputMeshDirectory, outputMeshName)
-          slicer.util.saveNode(currentMeshNode, outputMeshPath)
-          outputLMName = subjectID + '_align.mrk.json'
-          outputLMPath = os.path.join(outputLMDirectory, outputLMName)
-          slicer.util.saveNode(currentLMNode, outputLMPath)
-          # persist the (linear) alignment transform so downstream output can be
-          # mapped back to this subject's original coordinate frame by inverting it.
-          # The transform is keyed by the aligned output basename (subjectID + '_align')
-          # so it matches the DeCAL output landmark filenames. See runBackTransformLandmarks.
-          if transformDirectory:
-            transform.Update()
-            alignMatrix = vtk.vtkMatrix4x4()
-            alignMatrix.DeepCopy(transform.GetMatrix())
-            alignXfNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", subjectID + "_alignTransform")
-            alignXfNode.SetMatrixTransformToParent(alignMatrix)
-            transformPath = os.path.join(transformDirectory, subjectID + "_align.h5")
-            slicer.util.saveNode(alignXfNode, transformPath)
-            slicer.mrmlScene.RemoveNode(alignXfNode)
-          # optional semi-landmark alignment
-          if semilandmarkOption :
-            currentSLMNode = self.getLandmarkFileByID(slmDirectory, subjectID)
-            if currentSLMNode :
-              currentSLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
-              slicer.vtkSlicerTransformLogic().hardenTransform(currentSLMNode)
-              outputSLMName = subjectID + '_align.mrk.json'
-              outputSLMPath = os.path.join(outputSLMDirectory, outputSLMName)
-              slicer.util.saveNode(currentSLMNode, outputSLMPath)
-              slicer.mrmlScene.RemoveNode(currentSLMNode)
-          # clean up
-          try:
-            slicer.mrmlScene.RemoveNode(currentLMNode)
-            slicer.mrmlScene.RemoveNode(currentMeshNode)
-            slicer.mrmlScene.RemoveNode(transformNode)
-          except:
-            print(f"could not find nodes to remove for {subjectID}")
+    # Pause view rendering for the whole batch. Otherwise each per-subject
+    # progressCallback -> slicer.app.processEvents() (and the model loader itself)
+    # renders the freshly loaded mesh; that render is slow -- especially with
+    # software OpenGL over a remote display -- and dominates alignment time. The
+    # progress bar still updates because it is a Qt widget, not a rendered view.
+    slicer.app.pauseRender()
+    try:
+      for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
+        if progressCallback:
+          progressCallback(subjectCount, subjectTotal, "Rigid alignment")
+        if(not meshFileName.startswith(".")):
+          meshFilePath = os.path.join(meshDirectory, meshFileName)
+          subjectID = os.path.splitext(meshFileName)[0]
+          currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID, landmarkFileIndex)
+          if currentLMNode :
+            try:
+              currentMeshNode = slicer.util.loadModel(meshFilePath)
+            except:
+              self._removeNodeFully(currentLMNode)
+              continue
+            if currentLMNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
+              raise ValueError(f"Landmark points mismatch: subject has {currentLMNode.GetNumberOfControlPoints()} points, "
+                f"atlas has {baseLMNode.GetNumberOfControlPoints()} points")
+            # set up transform between base lms and current lms
+            sourcePoints = vtk.vtkPoints()
+            for i in range(currentLMNode.GetNumberOfControlPoints()):
+              point = currentLMNode.GetNthControlPointPosition(i)
+              sourcePoints.InsertNextPoint(point)
+              transform = vtk.vtkLandmarkTransform()
+              transform.SetSourceLandmarks(sourcePoints)
+              transform.SetTargetLandmarks(targetPoints)
+            if not removeScaleOption:
+              transform.SetModeToRigidBody()
+            else:
+              transform.SetModeToSimilarity()
+            transformNode=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode","Alignment")
+            transformNode.SetAndObserveTransformToParent(transform)
+            # apply transform to the current surface mesh and landmarks
+            currentMeshNode.SetAndObserveTransformNodeID(transformNode.GetID())
+            currentLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
+            slicer.vtkSlicerTransformLogic().hardenTransform(currentMeshNode)
+            slicer.vtkSlicerTransformLogic().hardenTransform(currentLMNode)
+            # save output files
+            outputMeshName = subjectID + '_align.ply'
+            outputMeshPath = os.path.join(ouputMeshDirectory, outputMeshName)
+            slicer.util.saveNode(currentMeshNode, outputMeshPath)
+            outputLMName = subjectID + '_align.mrk.json'
+            outputLMPath = os.path.join(outputLMDirectory, outputLMName)
+            slicer.util.saveNode(currentLMNode, outputLMPath)
+            # persist the (linear) alignment transform so downstream output can be
+            # mapped back to this subject's original coordinate frame by inverting it.
+            # The transform is keyed by the aligned output basename (subjectID + '_align')
+            # so it matches the DeCAL output landmark filenames. See runBackTransformLandmarks.
+            if transformDirectory:
+              transform.Update()
+              alignMatrix = vtk.vtkMatrix4x4()
+              alignMatrix.DeepCopy(transform.GetMatrix())
+              alignXfNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", subjectID + "_alignTransform")
+              alignXfNode.SetMatrixTransformToParent(alignMatrix)
+              transformPath = os.path.join(transformDirectory, subjectID + "_align.h5")
+              slicer.util.saveNode(alignXfNode, transformPath)
+              self._removeNodeFully(alignXfNode)
+            # optional semi-landmark alignment
+            if semilandmarkOption :
+              currentSLMNode = self.getLandmarkFileByID(slmDirectory, subjectID)
+              if currentSLMNode :
+                currentSLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
+                slicer.vtkSlicerTransformLogic().hardenTransform(currentSLMNode)
+                outputSLMName = subjectID + '_align.mrk.json'
+                outputSLMPath = os.path.join(outputSLMDirectory, outputSLMName)
+                slicer.util.saveNode(currentSLMNode, outputSLMPath)
+                self._removeNodeFully(currentSLMNode)
+            # clean up: remove the displayable nodes together with the display and
+            # storage nodes that loadModel/loadMarkups create, which otherwise
+            # orphan and accumulate across subjects.
+            try:
+              self._removeNodeFully(currentLMNode)
+              self._removeNodeFully(currentMeshNode)
+              self._removeNodeFully(transformNode)
+            except:
+              print(f"could not find nodes to remove for {subjectID}")
+    finally:
+      slicer.app.resumeRender()
 
   def distanceMatrix(self, a):
     """
