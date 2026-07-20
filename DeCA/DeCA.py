@@ -48,6 +48,13 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
   def setup(self):
     ScriptedLoadableModuleWidget.setup(self)
 
+    # Shared re-entrancy guard: the long-running handlers pump the Qt event loop
+    # (via progressCallback) so their progress bars update, which also lets a click
+    # on a different tab's trigger button be dispatched mid-run. All three run
+    # handlers share self.folderNames / self.atlasModel state, so a re-entrant call
+    # would corrupt an in-flight run. Each handler no-ops while this flag is set.
+    self._busy = False
+
     # Set up tabs to split workflow
     tabsWidget = qt.QTabWidget()
     DeCATab = qt.QWidget()
@@ -585,7 +592,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.subsetApplyButton.enabled = bool(self.DCLLandmarkDirectory.currentPath and self.pointSelection.currentNode())
 
   def onGenerateAtlasButton(self):
+    if self._busy:
+      return
+    self._busy = True
     self.getAtlasButton.enabled = False
+    succeeded = False
     try:
       logic = DeCALogic()
       progressCallback = self.makeProgressCallback(self.progressBarDCL)
@@ -620,9 +631,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       self.logInfoDCL.appendPlainText(f"Saving atlas landmarks to {atlasLMPath}")
       slicer.util.saveNode(self.atlasLMs, atlasLMPath)
       self.getPointNumberButton.enabled = True
+      succeeded = True
     finally:
+      self._busy = False
       self.getAtlasButton.enabled = True
-      self.resetProgressBar(self.progressBarDCL, "Atlas ready")
+      self.resetProgressBar(self.progressBarDCL, "Atlas ready" if succeeded else "Idle")
 
   def generateNewAtlas(self, removeScale, log, progressCallback=None):
     logic = DeCALogic()
@@ -653,7 +666,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     self.DCLApplyButton.enabled = True
 
   def onDCApplyButton(self):
+    if self._busy:
+      return
+    self._busy = True
     self.applyButtonDC.enabled = False
+    succeeded = False
     try:
       logic = DeCALogic()
       progressCallback = self.makeProgressCallback(self.progressBarDC)
@@ -745,12 +762,18 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
         ##
       slicer.mrmlScene.RemoveNode(self.atlasModel)
       slicer.mrmlScene.RemoveNode(self.atlasLMs)
+      succeeded = True
     finally:
+      self._busy = False
       self.applyButtonDC.enabled = True
-      self.resetProgressBar(self.progressBarDC, "Done")
+      self.resetProgressBar(self.progressBarDC, "Done" if succeeded else "Idle")
 
   def onDCLApplyButton(self):
+    if self._busy:
+      return
+    self._busy = True
     self.DCLApplyButton.enabled = False
+    succeeded = False
     try:
       logic = DeCALogic()
       progressCallback = self.makeProgressCallback(self.progressBarDCL)
@@ -801,9 +824,11 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       # setup for optional subsetting
       self.pointSelection.setCurrentNode(atlasDenseLandmarks)
       self.DCLLandmarkDirectory.setCurrentPath(self.folderNames['DeCALOutput'])
+      succeeded = True
     finally:
+      self._busy = False
       self.DCLApplyButton.enabled = True
-      self.resetProgressBar(self.progressBarDCL, "Done")
+      self.resetProgressBar(self.progressBarDCL, "Done" if succeeded else "Idle")
 
   def onSubsetApplyButton(self):
     logic = DeCALogic()
