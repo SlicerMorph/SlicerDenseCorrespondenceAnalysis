@@ -798,9 +798,13 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
         return
       # generate point correspondences
       self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
-      atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
-      self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback,
-      useFastCorrespondence=self.fastCorrespondenceCheckBoxDCL.checked)
+      try:
+        atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
+        self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback,
+        useFastCorrespondence=self.fastCorrespondenceCheckBoxDCL.checked)
+      except ValueError as errorText:
+        self.logInfoDCL.appendPlainText(str(errorText))
+        return
       # optionally merge the generated semi-landmarks with the fixed landmarks used
       # to establish correspondence (both are in the atlas-aligned coordinate frame)
       mergedCount = None
