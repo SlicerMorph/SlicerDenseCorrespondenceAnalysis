@@ -1098,6 +1098,34 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     sampleNumber = alignedPoints.GetNumberOfBlocks()
     pointCount = templateIndex.GetNumberOfValues()
     print("sample number:", sampleNumber)
+    # The resume-by-file-existence below only checks point count, which is identical
+    # for the exact and fast correspondence methods, so resuming into a folder that
+    # already holds results from a different method (or point density) would silently
+    # blend them. Record this run's method + point count once (in the parent run
+    # folder, which no landmark loader reads) and refuse to reuse a folder whose
+    # recorded settings differ, so mismatches fail loudly instead of mixing methods.
+    # The normal workflow writes each run to its own timestamped folder, so this only
+    # trips on deliberate folder reuse.
+    import json
+    runInfo = {"useFastCorrespondence": bool(useFastCorrespondence), "pointCount": int(pointCount)}
+    runInfoPath = os.path.join(os.path.dirname(os.path.normpath(outputDirectory)), ".decal_run_info")
+    if os.path.exists(runInfoPath):
+      try:
+        with open(runInfoPath) as runInfoFile:
+          existingRunInfo = json.load(runInfoFile)
+      except Exception:
+        existingRunInfo = None
+      if existingRunInfo != runInfo:
+        raise ValueError(
+          "The output folder already holds DeCAL results computed with different settings "
+          "(%s vs requested %s). Use a fresh output folder so exact and fast correspondences "
+          "are never mixed in one result." % (existingRunInfo, runInfo))
+    else:
+      try:
+        with open(runInfoPath, "w") as runInfoFile:
+          json.dump(runInfo, runInfoFile)
+      except OSError:
+        pass  # marker is best-effort; do not fail the run if it cannot be written
     # Write each subject's downsampled correspondence as soon as it is computed. A
     # crash then keeps every file already written, and re-running skips subjects
     # whose output already exists (resume). Batch the scene state and pause
