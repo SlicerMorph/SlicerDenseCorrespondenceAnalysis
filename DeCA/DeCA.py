@@ -1057,42 +1057,67 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     loadOption=False
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath, loadOption).GetPoints()
     modelExt=['ply','stl','vtp', 'vtk']
-    self.modelNames, models = self.importMeshes(meshDirectory, modelExt, progressCallback)
-    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
     self.outputDirectory = outputDirectory
-    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseNode.GetPolyData(), baseLandmarks, progressCallback)
-    # get downsampled template with index array
+    # Landmarks are small, so load them all -- Procrustes needs the whole sample.
+    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
+    # Mesh files in the same sorted order importMeshes/importLandmarks use, so the
+    # i-th mesh matches the i-th landmark block. Meshes are loaded one at a time in
+    # the loop below (not all up front) to keep memory flat on large datasets.
+    meshFiles = sorted(f for f in os.listdir(meshDirectory) if f.endswith(tuple(modelExt)))
+    self.modelNames = [os.path.splitext(f)[0] for f in meshFiles]
+    # meanShape, meanWarpedBase and the subsampling index are all independent of the
+    # per-subject correspondence, so compute them once up front. This lets each
+    # subject be computed, written and discarded inside the loop instead of building
+    # every corresponding mesh in memory and writing them all at the end.
+    meanShape, alignedPoints = self.procrustesImposition(landmarks, False)
+    meanWarpedBase = self._warpBaseMesh(baseNode.GetPolyData(), baseLandmarks, meanShape)
     indexArrayName = "indexArray"
     self.addIndexArray(baseNode, indexArrayName)
     templateModel = self.downsampleModel(baseNode, spacingPercentage)
     templateIndex = templateModel.GetPointData().GetArray(indexArrayName)
-    # saving point correspondences
-    if(templateIndex):
-      sampleNumber = denseCorrespondenceGroup.GetNumberOfBlocks()
-      print("sample number:", sampleNumber)
-      for i in range(sampleNumber):
-        alignedMesh = denseCorrespondenceGroup.GetBlock(i)
-        alignedPointNode= slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode',"alignedPoints")
-        for j in range(templateIndex.GetNumberOfValues()):
-          baseIndex = templateIndex.GetValue(j)
-          alignedPoint = alignedMesh.GetPoint(baseIndex)
-          alignedPointNode.AddControlPoint(alignedPoint, str(j))
-        outputLMPath = os.path.join(outputDirectory, self.modelNames[i]+".mrk.json")
-        slicer.util.saveNode(alignedPointNode, outputLMPath)
-        slicer.mrmlScene.RemoveNode(alignedPointNode)
-      # save base node correspondences
-      basePointNode= slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode',"atlasLandmarks")
-      for j in range(templateIndex.GetNumberOfValues()):
-        baseIndex = templateIndex.GetValue(j)
-        basePoint = baseNode.GetPolyData().GetPoint(baseIndex)
-        basePointNode.AddControlPoint(basePoint, str(j))
-      baseLMPath = os.path.join(outputDirectory, "atlas.mrk.json")
-      slicer.util.saveNode(basePointNode, baseLMPath)
-      #slicer.mrmlScene.RemoveNode(basePointNode)
-      return basePointNode
-    else:
+    if not templateIndex:
       print("No index found")
       return None
+    sampleNumber = alignedPoints.GetNumberOfBlocks()
+    pointCount = templateIndex.GetNumberOfValues()
+    print("sample number:", sampleNumber)
+    # Write each subject's downsampled correspondence as soon as it is computed. A
+    # crash then keeps every file already written, and re-running skips subjects
+    # whose output already exists (resume). Batch the scene state and pause
+    # rendering so the per-point AddControlPoint calls and the on-demand model
+    # loads/removes do not fire per-item scene updates or renders.
+    basePointNode = None
+    slicer.app.pauseRender()
+    slicer.mrmlScene.StartState(slicer.vtkMRMLScene.BatchProcessState)
+    try:
+      for i in range(sampleNumber):
+        if progressCallback:
+          progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
+        outputLMPath = os.path.join(outputDirectory, self.modelNames[i] + ".mrk.json")
+        if os.path.exists(outputLMPath):
+          continue  # already written on a previous (interrupted) run
+        subjectModelNode = slicer.util.loadModel(os.path.join(meshDirectory, meshFiles[i]))
+        correspondingMesh = self.denseSurfaceCorrespondencePair(
+          subjectModelNode.GetPolyData(), landmarks.GetBlock(i).GetPoints(),
+          meanWarpedBase, meanShape, i)
+        alignedPointNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', "alignedPoints")
+        for j in range(pointCount):
+          baseIndex = templateIndex.GetValue(j)
+          alignedPointNode.AddControlPoint(correspondingMesh.GetPoint(baseIndex), str(j))
+        slicer.util.saveNode(alignedPointNode, outputLMPath)
+        self._removeNodeFully(alignedPointNode)
+        self._removeNodeFully(subjectModelNode)
+      # atlas (base) correspondence -- independent of the subjects
+      basePointNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', "atlasLandmarks")
+      for j in range(pointCount):
+        baseIndex = templateIndex.GetValue(j)
+        basePointNode.AddControlPoint(baseNode.GetPolyData().GetPoint(baseIndex), str(j))
+      baseLMPath = os.path.join(outputDirectory, "atlas.mrk.json")
+      slicer.util.saveNode(basePointNode, baseLMPath)
+    finally:
+      slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
+      slicer.app.resumeRender()
+    return basePointNode
 
   def runMergeLandmarks(self, fixedLMDirectory, semiLMDirectory, outputDirectory, atlasFixedLMPath=None):
     # Merge each subject's fixed landmarks (used to establish correspondence) with
