@@ -346,6 +346,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCALWidgetLayout.addRow("Output landmarks in original frame: ", self.originalFrameCheckBoxDCL)
 
     #
+    # Fast (approximate) correspondence option -- DeCAL only, off by default
+    #
+    self.fastCorrespondenceCheckBoxDCL = qt.QCheckBox()
+    self.fastCorrespondenceCheckBoxDCL.checked = False
+    self.fastCorrespondenceCheckBoxDCL.setToolTip("Off (default) uses the canonical exact closest-point-on-surface correspondence, matching the published DeCA method. If checked, DeCAL computes correspondences with a much faster approximate method that snaps each point to the nearest mesh vertex instead of the exact closest point on the surface; on dense meshes the difference is typically a few hundredths of a millimeter. The atlas/template is always built with the exact method, and this option does not affect the DeCA tab.")
+    DeCALWidgetLayout.addRow("Compute fast correspondences: ", self.fastCorrespondenceCheckBoxDCL)
+
+    #
     # Apply Button
     #
     self.DCLApplyButton = qt.QPushButton("Run DeCAL")
@@ -790,8 +798,13 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
         return
       # generate point correspondences
       self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
-      atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
-      self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback)
+      try:
+        atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
+        self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback,
+        useFastCorrespondence=self.fastCorrespondenceCheckBoxDCL.checked)
+      except ValueError as errorText:
+        self.logInfoDCL.appendPlainText(str(errorText))
+        return
       # optionally merge the generated semi-landmarks with the fixed landmarks used
       # to establish correspondence (both are in the atlas-aligned coordinate frame)
       mergedCount = None
@@ -1023,6 +1036,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     Uses ScriptedLoadableModuleLogic base class, available at:
     https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
     """
+
   def runSubsetLandmarks(self, baseNode, lmDirectory, lmDirectorySubset):
     deletionIndex = []
     for i in range(baseNode.GetNumberOfControlPoints()):
@@ -1041,47 +1055,119 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     templateModel = self.downsampleModel(atlasNode, spacingPercentage)
     return templateModel, templateModel.GetNumberOfPoints()
 
-  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None):
+  def _existingLandmarkFileIsComplete(self, markupsPath, expectedPointCount):
+    # Resume must only skip a subject whose existing output is genuinely complete
+    # for the CURRENT parameters. Load the file and require its control-point count
+    # to equal expectedPointCount (derived from the current spacingTolerance / base
+    # mesh). A file truncated by a crash mid-write, or left over from a run with a
+    # different point density, fails this check and is recomputed rather than being
+    # silently trusted. (Resume still assumes the same atlas; the normal workflow
+    # writes each atlas run to its own timestamped output folder.)
+    node = None
+    try:
+      node = slicer.util.loadMarkups(markupsPath)
+      return node is not None and node.GetNumberOfControlPoints() == expectedPointCount
+    except Exception:
+      return False
+    finally:
+      if node is not None:
+        self._removeNodeFully(node)
+
+  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None, useFastCorrespondence=False):
     spacingPercentage = spacingTolerance/100
     loadOption=False
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath, loadOption).GetPoints()
     modelExt=['ply','stl','vtp', 'vtk']
-    self.modelNames, models = self.importMeshes(meshDirectory, modelExt, progressCallback)
-    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
     self.outputDirectory = outputDirectory
-    denseCorrespondenceGroup = self.denseCorrespondenceBaseMesh(landmarks, models, baseNode.GetPolyData(), baseLandmarks, progressCallback)
-    # get downsampled template with index array
+    # Landmarks are small, so load them all -- Procrustes needs the whole sample.
+    landmarkNames, landmarks = self.importLandmarks(landmarkDirectory, progressCallback)
+    # Mesh files in the same sorted order importMeshes/importLandmarks use, so the
+    # i-th mesh matches the i-th landmark block. Meshes are loaded one at a time in
+    # the loop below (not all up front) to keep memory flat on large datasets.
+    meshFiles = sorted(f for f in os.listdir(meshDirectory) if f.endswith(tuple(modelExt)))
+    self.modelNames = [os.path.splitext(f)[0] for f in meshFiles]
+    # meanShape, meanWarpedBase and the subsampling index are all independent of the
+    # per-subject correspondence, so compute them once up front. This lets each
+    # subject be computed, written and discarded inside the loop instead of building
+    # every corresponding mesh in memory and writing them all at the end.
+    meanShape, alignedPoints = self.procrustesImposition(landmarks, False)
+    meanWarpedBase = self._warpBaseMesh(baseNode.GetPolyData(), baseLandmarks, meanShape)
     indexArrayName = "indexArray"
     self.addIndexArray(baseNode, indexArrayName)
     templateModel = self.downsampleModel(baseNode, spacingPercentage)
     templateIndex = templateModel.GetPointData().GetArray(indexArrayName)
-    # saving point correspondences
-    if(templateIndex):
-      sampleNumber = denseCorrespondenceGroup.GetNumberOfBlocks()
-      print("sample number:", sampleNumber)
-      for i in range(sampleNumber):
-        alignedMesh = denseCorrespondenceGroup.GetBlock(i)
-        alignedPointNode= slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode',"alignedPoints")
-        for j in range(templateIndex.GetNumberOfValues()):
-          baseIndex = templateIndex.GetValue(j)
-          alignedPoint = alignedMesh.GetPoint(baseIndex)
-          alignedPointNode.AddControlPoint(alignedPoint, str(j))
-        outputLMPath = os.path.join(outputDirectory, self.modelNames[i]+".mrk.json")
-        slicer.util.saveNode(alignedPointNode, outputLMPath)
-        slicer.mrmlScene.RemoveNode(alignedPointNode)
-      # save base node correspondences
-      basePointNode= slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode',"atlasLandmarks")
-      for j in range(templateIndex.GetNumberOfValues()):
-        baseIndex = templateIndex.GetValue(j)
-        basePoint = baseNode.GetPolyData().GetPoint(baseIndex)
-        basePointNode.AddControlPoint(basePoint, str(j))
-      baseLMPath = os.path.join(outputDirectory, "atlas.mrk.json")
-      slicer.util.saveNode(basePointNode, baseLMPath)
-      #slicer.mrmlScene.RemoveNode(basePointNode)
-      return basePointNode
-    else:
+    if not templateIndex:
       print("No index found")
       return None
+    sampleNumber = alignedPoints.GetNumberOfBlocks()
+    pointCount = templateIndex.GetNumberOfValues()
+    print("sample number:", sampleNumber)
+    # The resume-by-file-existence below only checks point count, which is identical
+    # for the exact and fast correspondence methods, so resuming into a folder that
+    # already holds results from a different method (or point density) would silently
+    # blend them. Record this run's method + point count once (in the parent run
+    # folder, which no landmark loader reads) and refuse to reuse a folder whose
+    # recorded settings differ, so mismatches fail loudly instead of mixing methods.
+    # The normal workflow writes each run to its own timestamped folder, so this only
+    # trips on deliberate folder reuse.
+    import json
+    runInfo = {"useFastCorrespondence": bool(useFastCorrespondence), "pointCount": int(pointCount)}
+    runInfoPath = os.path.join(os.path.dirname(os.path.normpath(outputDirectory)), ".decal_run_info")
+    if os.path.exists(runInfoPath):
+      try:
+        with open(runInfoPath) as runInfoFile:
+          existingRunInfo = json.load(runInfoFile)
+      except Exception:
+        existingRunInfo = None
+      if existingRunInfo != runInfo:
+        raise ValueError(
+          "The output folder already holds DeCAL results computed with different settings "
+          "(%s vs requested %s). Use a fresh output folder so exact and fast correspondences "
+          "are never mixed in one result." % (existingRunInfo, runInfo))
+    else:
+      try:
+        with open(runInfoPath, "w") as runInfoFile:
+          json.dump(runInfo, runInfoFile)
+      except OSError:
+        pass  # marker is best-effort; do not fail the run if it cannot be written
+    # Write each subject's downsampled correspondence as soon as it is computed. A
+    # crash then keeps every file already written, and re-running skips subjects
+    # whose output already exists (resume). Batch the scene state and pause
+    # rendering so the per-point AddControlPoint calls and the on-demand model
+    # loads/removes do not fire per-item scene updates or renders.
+    basePointNode = None
+    slicer.app.pauseRender()
+    slicer.mrmlScene.StartState(slicer.vtkMRMLScene.BatchProcessState)
+    try:
+      for i in range(sampleNumber):
+        if progressCallback:
+          progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
+        outputLMPath = os.path.join(outputDirectory, self.modelNames[i] + ".mrk.json")
+        if os.path.exists(outputLMPath) and self._existingLandmarkFileIsComplete(outputLMPath, pointCount):
+          print("Skipping " + self.modelNames[i] + ": complete output already present (resume)")
+          continue
+        subjectModelNode = slicer.util.loadModel(os.path.join(meshDirectory, meshFiles[i]))
+        correspondingMesh = self.denseSurfaceCorrespondencePair(
+          subjectModelNode.GetPolyData(), landmarks.GetBlock(i).GetPoints(),
+          meanWarpedBase, meanShape, i, useFast=useFastCorrespondence)
+        alignedPointNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', "alignedPoints")
+        for j in range(pointCount):
+          baseIndex = templateIndex.GetValue(j)
+          alignedPointNode.AddControlPoint(correspondingMesh.GetPoint(baseIndex), str(j))
+        slicer.util.saveNode(alignedPointNode, outputLMPath)
+        self._removeNodeFully(alignedPointNode)
+        self._removeNodeFully(subjectModelNode)
+      # atlas (base) correspondence -- independent of the subjects
+      basePointNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', "atlasLandmarks")
+      for j in range(pointCount):
+        baseIndex = templateIndex.GetValue(j)
+        basePointNode.AddControlPoint(baseNode.GetPolyData().GetPoint(baseIndex), str(j))
+      baseLMPath = os.path.join(outputDirectory, "atlas.mrk.json")
+      slicer.util.saveNode(basePointNode, baseLMPath)
+    finally:
+      slicer.mrmlScene.EndState(slicer.vtkMRMLScene.BatchProcessState)
+      slicer.app.resumeRender()
+    return basePointNode
 
   def runMergeLandmarks(self, fixedLMDirectory, semiLMDirectory, outputDirectory, atlasFixedLMPath=None):
     # Merge each subject's fixed landmarks (used to establish correspondence) with
@@ -1439,6 +1525,26 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         currentNode = slicer.util.loadModel(filePath)
         return currentNode
 
+  def _removeNodeFully(self, node):
+    # Remove a node together with the display and storage nodes that
+    # slicer.util.loadModel / loadMarkups create for it. A plain
+    # RemoveNode(node) leaves those associated nodes orphaned in the scene, and
+    # across a long per-subject loop they accumulate and progressively slow the
+    # scene (and its rendering) down.
+    if node is None:
+      return
+    associatedNodes = []
+    if node.IsA("vtkMRMLDisplayableNode"):
+      for i in range(node.GetNumberOfDisplayNodes()):
+        associatedNodes.append(node.GetNthDisplayNode(i))
+    if node.IsA("vtkMRMLStorableNode"):
+      for i in range(node.GetNumberOfStorageNodes()):
+        associatedNodes.append(node.GetNthStorageNode(i))
+    slicer.mrmlScene.RemoveNode(node)
+    for associatedNode in associatedNodes:
+      if associatedNode is not None:
+        slicer.mrmlScene.RemoveNode(associatedNode)
+
   def runAlign(self, baseMeshNode, baseLMNode, meshDirectory, lmDirectory, ouputMeshDirectory, outputLMDirectory, removeScaleOption, slmDirectory=False, outputSLMDirector=False, transformDirectory=None, progressCallback=None):
     semilandmarkOption = bool(slmDirectory and outputSLMDirectory)
     targetPoints = vtk.vtkPoints()
@@ -1453,78 +1559,89 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     # Index the landmark directory once instead of re-listing it per subject
     # (avoids O(N^2) directory scans on large datasets / network storage).
     landmarkFileIndex = self.buildLandmarkFileIndex(lmDirectory)
-    for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
-      if progressCallback:
-        progressCallback(subjectCount, subjectTotal, "Rigid alignment")
-      if(not meshFileName.startswith(".")):
-        meshFilePath = os.path.join(meshDirectory, meshFileName)
-        subjectID = os.path.splitext(meshFileName)[0]
-        currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID, landmarkFileIndex)
-        if currentLMNode :
-          try:
-            currentMeshNode = slicer.util.loadModel(meshFilePath)
-          except:
-            slicer.mrmlScene.RemoveNode(currentLMNode)
-            continue
-          if currentLMNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
-            raise ValueError(f"Landmark points mismatch: subject has {currentLMNode.GetNumberOfControlPoints()} points, "
-              f"atlas has {baseLMNode.GetNumberOfControlPoints()} points")
-          # set up transform between base lms and current lms
-          sourcePoints = vtk.vtkPoints()
-          for i in range(currentLMNode.GetNumberOfControlPoints()):
-            point = currentLMNode.GetNthControlPointPosition(i)
-            sourcePoints.InsertNextPoint(point)
-            transform = vtk.vtkLandmarkTransform()
-            transform.SetSourceLandmarks(sourcePoints)
-            transform.SetTargetLandmarks(targetPoints)
-          if not removeScaleOption:
-            transform.SetModeToRigidBody()
-          else:
-            transform.SetModeToSimilarity()
-          transformNode=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode","Alignment")
-          transformNode.SetAndObserveTransformToParent(transform)
-          # apply transform to the current surface mesh and landmarks
-          currentMeshNode.SetAndObserveTransformNodeID(transformNode.GetID())
-          currentLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
-          slicer.vtkSlicerTransformLogic().hardenTransform(currentMeshNode)
-          slicer.vtkSlicerTransformLogic().hardenTransform(currentLMNode)
-          # save output files
-          outputMeshName = subjectID + '_align.ply'
-          outputMeshPath = os.path.join(ouputMeshDirectory, outputMeshName)
-          slicer.util.saveNode(currentMeshNode, outputMeshPath)
-          outputLMName = subjectID + '_align.mrk.json'
-          outputLMPath = os.path.join(outputLMDirectory, outputLMName)
-          slicer.util.saveNode(currentLMNode, outputLMPath)
-          # persist the (linear) alignment transform so downstream output can be
-          # mapped back to this subject's original coordinate frame by inverting it.
-          # The transform is keyed by the aligned output basename (subjectID + '_align')
-          # so it matches the DeCAL output landmark filenames. See runBackTransformLandmarks.
-          if transformDirectory:
-            transform.Update()
-            alignMatrix = vtk.vtkMatrix4x4()
-            alignMatrix.DeepCopy(transform.GetMatrix())
-            alignXfNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", subjectID + "_alignTransform")
-            alignXfNode.SetMatrixTransformToParent(alignMatrix)
-            transformPath = os.path.join(transformDirectory, subjectID + "_align.h5")
-            slicer.util.saveNode(alignXfNode, transformPath)
-            slicer.mrmlScene.RemoveNode(alignXfNode)
-          # optional semi-landmark alignment
-          if semilandmarkOption :
-            currentSLMNode = self.getLandmarkFileByID(slmDirectory, subjectID)
-            if currentSLMNode :
-              currentSLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
-              slicer.vtkSlicerTransformLogic().hardenTransform(currentSLMNode)
-              outputSLMName = subjectID + '_align.mrk.json'
-              outputSLMPath = os.path.join(outputSLMDirectory, outputSLMName)
-              slicer.util.saveNode(currentSLMNode, outputSLMPath)
-              slicer.mrmlScene.RemoveNode(currentSLMNode)
-          # clean up
-          try:
-            slicer.mrmlScene.RemoveNode(currentLMNode)
-            slicer.mrmlScene.RemoveNode(currentMeshNode)
-            slicer.mrmlScene.RemoveNode(transformNode)
-          except:
-            print(f"could not find nodes to remove for {subjectID}")
+    # Pause view rendering for the whole batch. Otherwise each per-subject
+    # progressCallback -> slicer.app.processEvents() (and the model loader itself)
+    # renders the freshly loaded mesh; that render is slow -- especially with
+    # software OpenGL over a remote display -- and dominates alignment time. The
+    # progress bar still updates because it is a Qt widget, not a rendered view.
+    slicer.app.pauseRender()
+    try:
+      for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
+        if progressCallback:
+          progressCallback(subjectCount, subjectTotal, "Rigid alignment")
+        if(not meshFileName.startswith(".")):
+          meshFilePath = os.path.join(meshDirectory, meshFileName)
+          subjectID = os.path.splitext(meshFileName)[0]
+          currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID, landmarkFileIndex)
+          if currentLMNode :
+            try:
+              currentMeshNode = slicer.util.loadModel(meshFilePath)
+            except:
+              self._removeNodeFully(currentLMNode)
+              continue
+            if currentLMNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
+              raise ValueError(f"Landmark points mismatch: subject has {currentLMNode.GetNumberOfControlPoints()} points, "
+                f"atlas has {baseLMNode.GetNumberOfControlPoints()} points")
+            # set up transform between base lms and current lms
+            sourcePoints = vtk.vtkPoints()
+            for i in range(currentLMNode.GetNumberOfControlPoints()):
+              point = currentLMNode.GetNthControlPointPosition(i)
+              sourcePoints.InsertNextPoint(point)
+              transform = vtk.vtkLandmarkTransform()
+              transform.SetSourceLandmarks(sourcePoints)
+              transform.SetTargetLandmarks(targetPoints)
+            if not removeScaleOption:
+              transform.SetModeToRigidBody()
+            else:
+              transform.SetModeToSimilarity()
+            transformNode=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode","Alignment")
+            transformNode.SetAndObserveTransformToParent(transform)
+            # apply transform to the current surface mesh and landmarks
+            currentMeshNode.SetAndObserveTransformNodeID(transformNode.GetID())
+            currentLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
+            slicer.vtkSlicerTransformLogic().hardenTransform(currentMeshNode)
+            slicer.vtkSlicerTransformLogic().hardenTransform(currentLMNode)
+            # save output files
+            outputMeshName = subjectID + '_align.ply'
+            outputMeshPath = os.path.join(ouputMeshDirectory, outputMeshName)
+            slicer.util.saveNode(currentMeshNode, outputMeshPath)
+            outputLMName = subjectID + '_align.mrk.json'
+            outputLMPath = os.path.join(outputLMDirectory, outputLMName)
+            slicer.util.saveNode(currentLMNode, outputLMPath)
+            # persist the (linear) alignment transform so downstream output can be
+            # mapped back to this subject's original coordinate frame by inverting it.
+            # The transform is keyed by the aligned output basename (subjectID + '_align')
+            # so it matches the DeCAL output landmark filenames. See runBackTransformLandmarks.
+            if transformDirectory:
+              transform.Update()
+              alignMatrix = vtk.vtkMatrix4x4()
+              alignMatrix.DeepCopy(transform.GetMatrix())
+              alignXfNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", subjectID + "_alignTransform")
+              alignXfNode.SetMatrixTransformToParent(alignMatrix)
+              transformPath = os.path.join(transformDirectory, subjectID + "_align.h5")
+              slicer.util.saveNode(alignXfNode, transformPath)
+              self._removeNodeFully(alignXfNode)
+            # optional semi-landmark alignment
+            if semilandmarkOption :
+              currentSLMNode = self.getLandmarkFileByID(slmDirectory, subjectID)
+              if currentSLMNode :
+                currentSLMNode.SetAndObserveTransformNodeID(transformNode.GetID())
+                slicer.vtkSlicerTransformLogic().hardenTransform(currentSLMNode)
+                outputSLMName = subjectID + '_align.mrk.json'
+                outputSLMPath = os.path.join(outputSLMDirectory, outputSLMName)
+                slicer.util.saveNode(currentSLMNode, outputSLMPath)
+                self._removeNodeFully(currentSLMNode)
+            # clean up: remove the displayable nodes together with the display and
+            # storage nodes that loadModel/loadMarkups create, which otherwise
+            # orphan and accumulate across subjects.
+            try:
+              self._removeNodeFully(currentLMNode)
+              self._removeNodeFully(currentMeshNode)
+              self._removeNodeFully(transformNode)
+            except:
+              print(f"could not find nodes to remove for {subjectID}")
+    finally:
+      slicer.app.resumeRender()
 
   def distanceMatrix(self, a):
     """
@@ -1738,7 +1855,55 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     meanTransformBaseFilter.Update()
     return meanTransformBaseFilter.GetOutput()
 
-  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration):
+  def _closestPointsToMesh(self, queryPoints, targetMesh, useFast=False):
+    # For each point in queryPoints (vtkPoints), return the corresponding point
+    # relative to targetMesh (vtkPolyData) as a new vtkPoints, index-aligned.
+    #
+    # Default (exact): closest point on the target *surface* via vtkCellLocator,
+    # looping per point in Python.
+    # Fast (useFast=True): nearest target *vertex* via a single vectorized scipy
+    # cKDTree query. Much faster but approximate; see issue #15. If scipy cannot be
+    # imported or installed, this logs a warning and falls back to the exact path.
+    if useFast:
+      cKDTree = None
+      try:
+        from scipy.spatial import cKDTree
+      except ImportError:
+        try:
+          slicer.util.pip_install('scipy')
+          from scipy.spatial import cKDTree
+        except Exception:
+          logging.warning("Fast correspondence requires scipy, which could not be "
+                          "imported or installed; falling back to the exact method.")
+      if cKDTree is not None:
+        targetXYZ = vtk_np.vtk_to_numpy(targetMesh.GetPoints().GetData())
+        queryXYZ = vtk_np.vtk_to_numpy(queryPoints.GetData())
+        tree = cKDTree(targetXYZ)
+        try:
+          _, matchedIndices = tree.query(queryXYZ, k=1, workers=-1)
+        except TypeError:  # older scipy without the workers kwarg
+          _, matchedIndices = tree.query(queryXYZ, k=1)
+        matchedXYZ = np.ascontiguousarray(targetXYZ[matchedIndices])
+        correspondingPoints = vtk.vtkPoints()
+        correspondingPoints.SetData(vtk_np.numpy_to_vtk(matchedXYZ, deep=True))
+        return correspondingPoints
+
+    cellLocator = vtk.vtkCellLocator()
+    cellLocator.SetDataSet(targetMesh)
+    cellLocator.BuildLocator()
+    point = [0,0,0]
+    correspondingPoint = [0,0,0]
+    correspondingPoints = vtk.vtkPoints()
+    cellId = vtk.reference(0)
+    subId = vtk.reference(0)
+    distance = vtk.reference(0.0)
+    for i in range(queryPoints.GetNumberOfPoints()):
+      queryPoints.GetPoint(i, point)
+      cellLocator.FindClosestPoint(point, correspondingPoint, cellId, subId, distance)
+      correspondingPoints.InsertPoint(i, correspondingPoint)
+    return correspondingPoints
+
+  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration, useFast=False):
     # TPS warp target mesh to meanshape. meanWarpedBase (the base mesh already
     # warped onto the mean shape) is supplied by the caller, computed once via
     # _warpBaseMesh since it is identical for every sample.
@@ -1770,20 +1935,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       plyWriterBase.Write()
 
     # Dense correspondence
-    cellLocator = vtk.vtkCellLocator()
-    cellLocator.SetDataSet(meanWarpedMesh)
-    cellLocator.BuildLocator()
-
-    point = [0,0,0]
-    correspondingPoint = [0,0,0]
-    correspondingPoints = vtk.vtkPoints()
-    cellId = vtk.reference(0)
-    subId = vtk.reference(0)
-    distance = vtk.reference(0.0)
-    for i in range(meanWarpedBase.GetNumberOfPoints()):
-      meanWarpedBase.GetPoint(i,point)
-      cellLocator.FindClosestPoint(point,correspondingPoint,cellId, subId, distance)
-      correspondingPoints.InsertPoint(i,correspondingPoint)
+    correspondingPoints = self._closestPointsToMesh(meanWarpedBase.GetPoints(), meanWarpedMesh, useFast=useFast)
 
     #Copy points into mesh with base connectivity
     correspondingMesh = vtk.vtkPolyData()
