@@ -1052,6 +1052,24 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     templateModel = self.downsampleModel(atlasNode, spacingPercentage)
     return templateModel, templateModel.GetNumberOfPoints()
 
+  def _existingLandmarkFileIsComplete(self, markupsPath, expectedPointCount):
+    # Resume must only skip a subject whose existing output is genuinely complete
+    # for the CURRENT parameters. Load the file and require its control-point count
+    # to equal expectedPointCount (derived from the current spacingTolerance / base
+    # mesh). A file truncated by a crash mid-write, or left over from a run with a
+    # different point density, fails this check and is recomputed rather than being
+    # silently trusted. (Resume still assumes the same atlas; the normal workflow
+    # writes each atlas run to its own timestamped output folder.)
+    node = None
+    try:
+      node = slicer.util.loadMarkups(markupsPath)
+      return node is not None and node.GetNumberOfControlPoints() == expectedPointCount
+    except Exception:
+      return False
+    finally:
+      if node is not None:
+        self._removeNodeFully(node)
+
   def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None):
     spacingPercentage = spacingTolerance/100
     loadOption=False
@@ -1094,8 +1112,9 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         if progressCallback:
           progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
         outputLMPath = os.path.join(outputDirectory, self.modelNames[i] + ".mrk.json")
-        if os.path.exists(outputLMPath):
-          continue  # already written on a previous (interrupted) run
+        if os.path.exists(outputLMPath) and self._existingLandmarkFileIsComplete(outputLMPath, pointCount):
+          print("Skipping " + self.modelNames[i] + ": complete output already present (resume)")
+          continue
         subjectModelNode = slicer.util.loadModel(os.path.join(meshDirectory, meshFiles[i]))
         correspondingMesh = self.denseSurfaceCorrespondencePair(
           subjectModelNode.GetPolyData(), landmarks.GetBlock(i).GetPoints(),
