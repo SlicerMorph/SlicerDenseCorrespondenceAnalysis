@@ -346,6 +346,14 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
     DeCALWidgetLayout.addRow("Output landmarks in original frame: ", self.originalFrameCheckBoxDCL)
 
     #
+    # Fast (approximate) correspondence option -- DeCAL only, off by default
+    #
+    self.fastCorrespondenceCheckBoxDCL = qt.QCheckBox()
+    self.fastCorrespondenceCheckBoxDCL.checked = False
+    self.fastCorrespondenceCheckBoxDCL.setToolTip("Off (default) uses the canonical exact closest-point-on-surface correspondence, matching the published DeCA method. If checked, DeCAL computes correspondences with a much faster approximate method that snaps each point to the nearest mesh vertex instead of the exact closest point on the surface; on dense meshes the difference is typically a few hundredths of a millimeter. The atlas/template is always built with the exact method, and this option does not affect the DeCA tab.")
+    DeCALWidgetLayout.addRow("Compute fast correspondences: ", self.fastCorrespondenceCheckBoxDCL)
+
+    #
     # Apply Button
     #
     self.DCLApplyButton = qt.QPushButton("Run DeCAL")
@@ -791,7 +799,8 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
       # generate point correspondences
       self.logInfoDCL.appendPlainText(f"Calculating point correspondences")
       atlasDenseLandmarks = logic.runDeCAL(self.atlasModel, self.atlasLMs, self.folderNames['alignedModels'],
-      self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback)
+      self.folderNames['alignedLMs'], self.folderNames['DeCALOutput'], self.spacingTolerance.value, progressCallback,
+      useFastCorrespondence=self.fastCorrespondenceCheckBoxDCL.checked)
       # optionally merge the generated semi-landmarks with the fixed landmarks used
       # to establish correspondence (both are in the atlas-aligned coordinate frame)
       mergedCount = None
@@ -1024,16 +1033,6 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
     """
 
-  # Phase 2 (issue #15) performance opt-in. When False (default), the dense
-  # correspondence step uses the exact vtkCellLocator closest-point-on-surface
-  # query. When True, it uses a vectorized scipy cKDTree nearest-VERTEX query,
-  # which is much faster but approximate (snaps to the nearest target vertex
-  # instead of the closest point on a triangle). Class-level so it applies to the
-  # internal DeCALogic() instances created deep in the atlas-build call chain;
-  # set DeCALogic.useFastCorrespondence = True (or logic.useFastCorrespondence)
-  # to opt in. Kept default-off until the approximation is validated.
-  useFastCorrespondence = False
-
   def runSubsetLandmarks(self, baseNode, lmDirectory, lmDirectorySubset):
     deletionIndex = []
     for i in range(baseNode.GetNumberOfControlPoints()):
@@ -1070,7 +1069,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       if node is not None:
         self._removeNodeFully(node)
 
-  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None):
+  def runDeCAL(self, baseNode, baseLMPath, meshDirectory, landmarkDirectory, outputDirectory, spacingTolerance, progressCallback=None, useFastCorrespondence=False):
     spacingPercentage = spacingTolerance/100
     loadOption=False
     baseLandmarks=self.fiducialNodeToPolyData(baseLMPath, loadOption).GetPoints()
@@ -1118,7 +1117,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         subjectModelNode = slicer.util.loadModel(os.path.join(meshDirectory, meshFiles[i]))
         correspondingMesh = self.denseSurfaceCorrespondencePair(
           subjectModelNode.GetPolyData(), landmarks.GetBlock(i).GetPoints(),
-          meanWarpedBase, meanShape, i)
+          meanWarpedBase, meanShape, i, useFast=useFastCorrespondence)
         alignedPointNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', "alignedPoints")
         for j in range(pointCount):
           baseIndex = templateIndex.GetValue(j)
@@ -1824,31 +1823,38 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     meanTransformBaseFilter.Update()
     return meanTransformBaseFilter.GetOutput()
 
-  def _closestPointsToMesh(self, queryPoints, targetMesh):
+  def _closestPointsToMesh(self, queryPoints, targetMesh, useFast=False):
     # For each point in queryPoints (vtkPoints), return the corresponding point
     # relative to targetMesh (vtkPolyData) as a new vtkPoints, index-aligned.
     #
     # Default (exact): closest point on the target *surface* via vtkCellLocator,
     # looping per point in Python.
-    # Fast (self.useFastCorrespondence): nearest target *vertex* via a single
-    # vectorized scipy cKDTree query. Much faster but approximate; see issue #15.
-    if self.useFastCorrespondence:
+    # Fast (useFast=True): nearest target *vertex* via a single vectorized scipy
+    # cKDTree query. Much faster but approximate; see issue #15. If scipy cannot be
+    # imported or installed, this logs a warning and falls back to the exact path.
+    if useFast:
+      cKDTree = None
       try:
         from scipy.spatial import cKDTree
       except ImportError:
-        slicer.util.pip_install('scipy')
-        from scipy.spatial import cKDTree
-      targetXYZ = vtk_np.vtk_to_numpy(targetMesh.GetPoints().GetData())
-      queryXYZ = vtk_np.vtk_to_numpy(queryPoints.GetData())
-      tree = cKDTree(targetXYZ)
-      try:
-        _, matchedIndices = tree.query(queryXYZ, k=1, workers=-1)
-      except TypeError:  # older scipy without the workers kwarg
-        _, matchedIndices = tree.query(queryXYZ, k=1)
-      matchedXYZ = np.ascontiguousarray(targetXYZ[matchedIndices])
-      correspondingPoints = vtk.vtkPoints()
-      correspondingPoints.SetData(vtk_np.numpy_to_vtk(matchedXYZ, deep=True))
-      return correspondingPoints
+        try:
+          slicer.util.pip_install('scipy')
+          from scipy.spatial import cKDTree
+        except Exception:
+          logging.warning("Fast correspondence requires scipy, which could not be "
+                          "imported or installed; falling back to the exact method.")
+      if cKDTree is not None:
+        targetXYZ = vtk_np.vtk_to_numpy(targetMesh.GetPoints().GetData())
+        queryXYZ = vtk_np.vtk_to_numpy(queryPoints.GetData())
+        tree = cKDTree(targetXYZ)
+        try:
+          _, matchedIndices = tree.query(queryXYZ, k=1, workers=-1)
+        except TypeError:  # older scipy without the workers kwarg
+          _, matchedIndices = tree.query(queryXYZ, k=1)
+        matchedXYZ = np.ascontiguousarray(targetXYZ[matchedIndices])
+        correspondingPoints = vtk.vtkPoints()
+        correspondingPoints.SetData(vtk_np.numpy_to_vtk(matchedXYZ, deep=True))
+        return correspondingPoints
 
     cellLocator = vtk.vtkCellLocator()
     cellLocator.SetDataSet(targetMesh)
@@ -1865,7 +1871,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       correspondingPoints.InsertPoint(i, correspondingPoint)
     return correspondingPoints
 
-  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration):
+  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration, useFast=False):
     # TPS warp target mesh to meanshape. meanWarpedBase (the base mesh already
     # warped onto the mean shape) is supplied by the caller, computed once via
     # _warpBaseMesh since it is identical for every sample.
@@ -1897,7 +1903,7 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       plyWriterBase.Write()
 
     # Dense correspondence
-    correspondingPoints = self._closestPointsToMesh(meanWarpedBase.GetPoints(), meanWarpedMesh)
+    correspondingPoints = self._closestPointsToMesh(meanWarpedBase.GetPoints(), meanWarpedMesh, useFast=useFast)
 
     #Copy points into mesh with base connectivity
     correspondingMesh = vtk.vtkPolyData()
