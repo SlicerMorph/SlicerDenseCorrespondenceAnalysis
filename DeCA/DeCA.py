@@ -1399,7 +1399,26 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     averageLandmarkNode.GetDisplayNode().SetPointLabelsVisibility(False)
     return averageModelNode, averageLandmarkNode
 
-  def getLandmarkFileByID(self, directory, subjectID):
+  def buildLandmarkFileIndex(self, directory):
+    # Map subjectID -> landmark filename by stripping landmark suffixes. Built
+    # once by callers that would otherwise call getLandmarkFileByID in a loop,
+    # which re-lists the whole directory on every lookup (O(N^2) for N subjects).
+    fileIndex = {}
+    for fileName in os.listdir(directory):
+      fileNameBase = Path(fileName)
+      while fileNameBase.suffix in {'.fcsv', '.mrk', '.json'}:
+        fileNameBase = fileNameBase.with_suffix('')
+      # first match wins, matching getLandmarkFileByID's os.listdir scan order
+      fileIndex.setdefault(str(fileNameBase), fileName)
+    return fileIndex
+
+  def getLandmarkFileByID(self, directory, subjectID, fileIndex=None):
+    if fileIndex is not None:
+      # use a prebuilt {subjectID: fileName} index to avoid re-listing directory
+      fileName = fileIndex.get(subjectID)
+      if fileName is not None:
+        return slicer.util.loadMarkups(os.path.join(directory, fileName))
+      return None
     fileList = os.listdir(directory)
     for fileName in fileList:
       fileNameBase = Path(fileName)
@@ -1431,14 +1450,16 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     # Transform each subject to base
     subjectFileNames = [f for f in os.listdir(meshDirectory) if not f.startswith(".")]
     subjectTotal = len(subjectFileNames)
+    # Index the landmark directory once instead of re-listing it per subject
+    # (avoids O(N^2) directory scans on large datasets / network storage).
+    landmarkFileIndex = self.buildLandmarkFileIndex(lmDirectory)
     for subjectCount, meshFileName in enumerate(subjectFileNames, start=1):
       if progressCallback:
         progressCallback(subjectCount, subjectTotal, "Rigid alignment")
       if(not meshFileName.startswith(".")):
-        lmFileList = os.listdir(lmDirectory)
         meshFilePath = os.path.join(meshDirectory, meshFileName)
         subjectID = os.path.splitext(meshFileName)[0]
-        currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID)
+        currentLMNode = self.getLandmarkFileByID(lmDirectory, subjectID, landmarkFileIndex)
         if currentLMNode :
           try:
             currentMeshNode = slicer.util.loadModel(meshFilePath)
@@ -1635,12 +1656,14 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     baseIndex = self.getClosestToMeanIndex(meanShape, alignedPoints)
     baseMesh = originalMeshes.GetBlock(baseIndex)
     baseLandmarks = originalLandmarks.GetBlock(baseIndex).GetPoints()
+    # The base mesh warped onto the mean shape is identical for every sample, so
+    # compute it once here instead of re-running the TPS solve + warp per sample.
+    meanWarpedBase = self._warpBaseMesh(baseMesh, baseLandmarks, meanShape)
     for i in range(sampleNumber):
       if progressCallback:
         progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
       correspondingMesh = self.denseSurfaceCorrespondencePair(originalMeshes.GetBlock(i),
-      originalLandmarks.GetBlock(i).GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
-      baseMesh, baseLandmarks, meanShape, i)
+      originalLandmarks.GetBlock(i).GetPoints(), meanWarpedBase, meanShape, i)
       denseCorrespondenceGroup.AddInputData(correspondingMesh)
 
     denseCorrespondenceGroup.Update()
@@ -1687,18 +1710,38 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     sampleNumber = alignedPoints.GetNumberOfBlocks()
     print("procrustes aligned samples: ", sampleNumber)
     denseCorrespondenceGroup = vtk.vtkMultiBlockDataGroupFilter()
+    # The base mesh warped onto the mean shape is identical for every sample, so
+    # compute it once here instead of re-running the TPS solve + warp per sample.
+    meanWarpedBase = self._warpBaseMesh(baseMesh, baseLandmarks, meanShape)
     for i in range(sampleNumber):
       if progressCallback:
         progressCallback(i + 1, sampleNumber, "Computing dense correspondence")
       correspondingMesh = self.denseSurfaceCorrespondencePair(originalMeshes.GetBlock(i),
-      originalLandmarks.GetBlock(i).GetPoints(), alignedPoints.GetBlock(i).GetPoints(),
-      baseMesh, baseLandmarks, meanShape, i)
+      originalLandmarks.GetBlock(i).GetPoints(), meanWarpedBase, meanShape, i)
       denseCorrespondenceGroup.AddInputData(correspondingMesh)
     denseCorrespondenceGroup.Update()
     return denseCorrespondenceGroup.GetOutput()
 
-  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, alignedLandmarks, baseMesh, baseLandmarks, meanShape, iteration):
-    # TPS warp target and base mesh to meanshape
+  def _warpBaseMesh(self, baseMesh, baseLandmarks, meanShape):
+    # TPS-warp the base mesh onto the mean shape. This depends only on the base
+    # mesh / base landmarks / mean shape, which are all fixed across the per-sample
+    # correspondence loop, so callers compute it once and pass the result into
+    # denseSurfaceCorrespondencePair rather than recomputing it for every sample.
+    meanTransformBase = vtk.vtkThinPlateSplineTransform()
+    meanTransformBase.SetSourceLandmarks(baseLandmarks)
+    meanTransformBase.SetTargetLandmarks(meanShape)
+    meanTransformBase.SetBasisToR() # for 3D transform
+
+    meanTransformBaseFilter = vtk.vtkTransformPolyDataFilter()
+    meanTransformBaseFilter.SetInputData(baseMesh)
+    meanTransformBaseFilter.SetTransform(meanTransformBase)
+    meanTransformBaseFilter.Update()
+    return meanTransformBaseFilter.GetOutput()
+
+  def denseSurfaceCorrespondencePair(self, originalMesh, originalLandmarks, meanWarpedBase, meanShape, iteration):
+    # TPS warp target mesh to meanshape. meanWarpedBase (the base mesh already
+    # warped onto the mean shape) is supplied by the caller, computed once via
+    # _warpBaseMesh since it is identical for every sample.
     meanTransform = vtk.vtkThinPlateSplineTransform()
     meanTransform.SetSourceLandmarks(originalLandmarks)
     meanTransform.SetTargetLandmarks(meanShape)
@@ -1709,17 +1752,6 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     meanTransformFilter.SetTransform(meanTransform)
     meanTransformFilter.Update()
     meanWarpedMesh = meanTransformFilter.GetOutput()
-
-    meanTransformBase = vtk.vtkThinPlateSplineTransform()
-    meanTransformBase.SetSourceLandmarks(baseLandmarks)
-    meanTransformBase.SetTargetLandmarks(meanShape)
-    meanTransformBase.SetBasisToR() # for 3D transform
-
-    meanTransformBaseFilter = vtk.vtkTransformPolyDataFilter()
-    meanTransformBaseFilter.SetInputData(baseMesh)
-    meanTransformBaseFilter.SetTransform(meanTransformBase)
-    meanTransformBaseFilter.Update()
-    meanWarpedBase = meanTransformBaseFilter.GetOutput()
 
     # write ouput
     if hasattr(self,"errorCheckPath"):
