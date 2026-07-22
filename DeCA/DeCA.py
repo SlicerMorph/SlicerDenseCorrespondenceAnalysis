@@ -1342,6 +1342,9 @@ class DeCALogic(ScriptedLoadableModuleLogic):
       mirrorSLMIndexList=mirrorSLMIndexText.split(",")
       mirrorSLMIndexList=[int(x) for x in mirrorSLMIndexList]
       mirrorSLMIndex=np.asarray(mirrorSLMIndexList)
+    # Fail fast if mesh/landmark filenames do not line up (same exact-base-name
+    # matching as runAlign); otherwise every subject is silently skipped.
+    self.checkMeshLandmarkMatch(meshDirectory, lmDirectory)
     for meshFileName in os.listdir(meshDirectory):
       if(not meshFileName.startswith(".")):
         meshFilePath = os.path.join(meshDirectory, meshFileName)
@@ -1516,6 +1519,48 @@ class DeCALogic(ScriptedLoadableModuleLogic):
         currentNode = slicer.util.loadMarkups(filePath)
         return currentNode
 
+  def checkMeshLandmarkMatch(self, meshDirectory, lmDirectory, landmarkFileIndex=None):
+    # Pre-flight check for the per-subject filename matching used by runAlign and
+    # runMirroring. A mesh <id>.<ext> is paired with the landmark file whose name,
+    # after stripping the .fcsv/.mrk/.json suffixes, is exactly <id>. When that
+    # naming convention is broken (e.g. every landmark file carries an extra
+    # "_fixed" suffix), the per-subject lookup returns nothing and each subject is
+    # silently skipped -- the run finishes "successfully" with an empty output
+    # directory. Raise a descriptive ValueError instead so the user can see the
+    # mismatch and rename the files. Callers already forward ValueError to the log.
+    if landmarkFileIndex is None:
+      landmarkFileIndex = self.buildLandmarkFileIndex(lmDirectory)
+    meshFileNames = [f for f in os.listdir(meshDirectory) if not f.startswith(".")]
+    unmatchedMeshes = sorted((f, os.path.splitext(f)[0]) for f in meshFileNames
+                             if os.path.splitext(f)[0] not in landmarkFileIndex)
+    if not unmatchedMeshes:
+      return
+    exampleLimit = 5
+    lmFileNames = sorted(f for f in os.listdir(lmDirectory) if not f.startswith("."))
+    lines = [
+      f"Could not match landmark files to meshes by filename: "
+      f"{len(unmatchedMeshes)} of {len(meshFileNames)} mesh(es) have no landmark file.",
+      "",
+      "Each mesh is matched to the landmark file whose name, without the "
+      ".fcsv/.mrk/.json suffix, is identical to the mesh name without its extension.",
+      "",
+      "Meshes with no matching landmark file (mesh -> expected landmark base name):",
+    ]
+    for meshFileName, subjectID in unmatchedMeshes[:exampleLimit]:
+      lines.append(f"    {meshFileName} -> {subjectID}")
+    if len(unmatchedMeshes) > exampleLimit:
+      lines.append(f"    ... and {len(unmatchedMeshes) - exampleLimit} more")
+    lines.append("")
+    lines.append("Landmark files found in the landmark directory:")
+    for lmFileName in lmFileNames[:exampleLimit]:
+      lines.append(f"    {lmFileName}")
+    if len(lmFileNames) > exampleLimit:
+      lines.append(f"    ... and {len(lmFileNames) - exampleLimit} more")
+    lines.append("")
+    lines.append("Rename the files so their base names match exactly (for example, "
+                 "remove a '_fixed' suffix from the landmark files), then rerun.")
+    raise ValueError("\n".join(lines))
+
   def getModelFileByID(self, directory, subjectID):
     fileList = os.listdir(directory)
     for fileName in fileList:
@@ -1559,6 +1604,10 @@ class DeCALogic(ScriptedLoadableModuleLogic):
     # Index the landmark directory once instead of re-listing it per subject
     # (avoids O(N^2) directory scans on large datasets / network storage).
     landmarkFileIndex = self.buildLandmarkFileIndex(lmDirectory)
+    # Fail fast with a clear message if the mesh/landmark filenames do not line up,
+    # rather than silently skipping every subject and leaving an empty output dir
+    # that looks like a successful run.
+    self.checkMeshLandmarkMatch(meshDirectory, lmDirectory, landmarkFileIndex)
     # Pause view rendering for the whole batch. Otherwise each per-subject
     # progressCallback -> slicer.app.processEvents() (and the model loader itself)
     # renders the freshly loaded mesh; that render is slow -- especially with
