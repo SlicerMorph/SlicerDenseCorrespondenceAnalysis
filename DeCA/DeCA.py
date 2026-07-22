@@ -759,8 +759,12 @@ class DeCAWidget(ScriptedLoadableModuleWidget):
 
         # mirror_map_string was already generated and validated at the start of onDCApplyButton
         self.logInfoDC.appendPlainText(f"Generating mirrored models and landmarks")
-        logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
-        self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the validated string
+        try:
+          logic.runMirroring(self.folderNames['alignedModels'], self.folderNames['alignedLMs'], self.folderNames['mirrorModels'],
+          self.folderNames['mirrorLMs'], axis, mirror_map_string) # Use the validated string
+        except ValueError as errorText:
+          self.logInfoDC.appendPlainText(str(errorText))
+          return
         self.logInfoDC.appendPlainText(f"Calculating point correspondences to atlas")
         logic.runDCAlignSymmetric(atlasModelPath, atlasLMPath, self.folderNames['alignedModels'],
         self.folderNames['alignedLMs'], self.folderNames['mirrorModels'], self.folderNames['mirrorLMs'], self.folderNames['output'],
